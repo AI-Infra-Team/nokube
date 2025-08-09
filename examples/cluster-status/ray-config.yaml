@@ -1,0 +1,43 @@
+# Ray 集群配置
+
+# Ray 特有配置
+ray_spec:
+  dashboard_port: 8265
+  max_workers: 10
+
+# 节点列表
+nodes:
+  - ssh_url: "localhost:10001"
+    name: "ray-head-node"  # 实际系统看到的节点名
+    role: "head"
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/head"
+    users:
+      - userid: "ray-admin"
+        password: "ray123"
+      - userid: "ray-user"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+    
+  - ssh_url: "localhost:10002"
+    name: "ray-worker-1"   # 实际系统看到的节点名
+    role: "worker"
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-1"
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+  - ssh_url: "localhost:10003"
+    name: "ray-worker-2"   # 实际系统看到的节点名
+    role: "worker"
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-2"
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..." 

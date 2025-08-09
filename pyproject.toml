@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nokube"
+version = "0.1.0"
+description = "Kubernetes YAML 驱动的开发环境"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "NoKube Team", email = "team@nokube.dev"}
+]
+keywords = ["kubernetes", "docker", "ray", "container", "orchestration", "development"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Clustering",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.0.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "docker>=6.0.0",
+    "kubernetes>=28.0.0",
+    "ray[serve]>=2.7.0",
+    "etcd3>=0.12.0,<0.13.0",
+    "pydantic>=2.0.0",
+    "requests>=2.26.0",
+    "protobuf>=3.19.0,<=3.20.4",
+    "grpcio>=1.48.0,<2.0.0",
+    "psutil>=5.9.0",
+    "paramiko>=3.0.0",
+    "pyscript_util",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.2",
+    "black>=23.9.1",
+    "flake8>=6.1.0",
+    "mypy>=1.5.0",
+]
+docs = [
+    "sphinx>=5.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/nokube/nokube"
+Documentation = "https://nokube.readthedocs.io/"
+Repository = "https://github.com/nokube/nokube"
+"Bug Reports" = "https://github.com/nokube/nokube/issues"
+
+[project.scripts]
+nokube = "src.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"] 

@@ -1,0 +1,12 @@
+api_server: "https://k8s.example.com:6443"
+context: "prod-cluster"
+namespace: "production"
+resources:
+  cpu_limit: "8"
+  memory_limit: "16Gi"
+ingress:
+  enabled: true
+  host: "prod.example.com"
+  tls:
+    enabled: true
+    secret_name: "prod-tls" 

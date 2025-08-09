@@ -1,0 +1,74 @@
+# Git 仓库监控配置
+repositories:
+  - name: "my-app"
+    url: "https://github.com/username/my-app.git"
+    branch: "main"
+    path: "k8s/"
+    target_cluster: "ray-prod"  # 指定目标集群
+    deployment_target: "ray"  # 部署目标类型
+    auto_deploy: true
+    webhook_enabled: true
+    webhook_secret: "your-webhook-secret"
+    notification:
+      slack_webhook: "https://hooks.slack.com/services/..."
+      email: "dev-team@company.com"
+    schedule:
+      scan_interval: 300  # 5分钟扫描一次
+      max_retries: 3
+      retry_delay: 60
+    filters:
+      file_patterns: ["*.yaml", "*.yml"]
+      exclude_patterns: ["*test*", "*temp*"]
+      max_file_size: 1048576  # 1MB
+    security:
+      ssh_key_path: "/opt/nokube/ssh/id_rsa"
+      known_hosts_path: "/opt/nokube/ssh/known_hosts"
+      verify_ssl: true
+    limits:
+      max_concurrent_deployments: 5
+      max_deployment_time: 1800  # 30分钟
+      max_log_size: 10485760  # 10MB
+
+  - name: "staging-app"
+    url: "https://github.com/username/staging-app.git"
+    branch: "develop"
+    path: "deploy/"
+    target_cluster: "ray-staging"  # 指定目标集群
+    deployment_target: "ray"  # 部署目标类型
+    auto_deploy: false
+    webhook_enabled: false
+    notification:
+      email: "staging-team@company.com"
+    schedule:
+      scan_interval: 600  # 10分钟扫描一次
+    filters:
+      file_patterns: ["*.yaml", "*.yml"]
+      exclude_patterns: ["*test*"]
+    security:
+      ssh_key_path: "/opt/nokube/ssh/id_rsa"
+      verify_ssl: true
+    limits:
+      max_concurrent_deployments: 2
+      max_deployment_time: 900  # 15分钟
+
+# 全局配置
+global:
+  check_interval: 300
+  max_workers: 5
+  log_level: "INFO"
+  storage:
+    type: "file"
+    path: "./data/watcher-state.json"
+  
+  notifications:
+    email:
+      enabled: false
+      smtp_server: "smtp.gmail.com"
+      smtp_port: 587
+      username: "your-email@gmail.com"
+      password: "your-password"
+    
+    webhook:
+      enabled: true
+      url: "https://hooks.slack.com/services/xxx"
+      events: ["config_change", "deploy_success", "deploy_failed"] 

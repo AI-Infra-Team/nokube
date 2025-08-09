@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nokube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-watcher
+  namespace: nokube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: git-watcher
+  template:
+    metadata:
+      labels:
+        app: git-watcher
+    spec:
+      containers:
+      - name: git-watcher
+        image: nokube/git-watcher:latest
+        env:
+        - name: CONFIG_PATH
+          value: "/app/config/repos.yaml"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: git-watcher-secrets
+              key: github-token
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: data-volume
+          mountPath: /app/data
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: git-watcher-config
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: git-watcher-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-watcher-service
+  namespace: nokube-system
+spec:
+  selector:
+    app: git-watcher
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-watcher-config
+  namespace: nokube-system
+data:
+  repos.yaml: |
+    repositories:
+      - name: "example-app"
+        url: "https://github.com/example/example-app.git"
+        branch: "main"
+        config_path: "k8s/configmap.yaml"
+        deployment_name: "example-app"
+        namespace: "default"
+        check_interval: 300
+        auth:
+          type: "https"
+          token: "${GITHUB_TOKEN}"
+      
+      - name: "microservice-api"
+        url: "https://github.com/example/microservice-api.git"
+        branch: "develop"
+        config_path: "deploy/config.yaml"
+        deployment_name: "api-service"
+        namespace: "api"
+        check_interval: 600
+        auth:
+          type: "ssh"
+          key_path: "~/.ssh/id_rsa"
+    
+    global:
+      check_interval: 300
+      max_workers: 5
+      log_level: "INFO"
+      storage:
+        type: "file"
+        path: "/app/data/watcher-state.json"
+      
+      notifications:
+        email:
+          enabled: false
+          smtp_server: "smtp.gmail.com"
+          smtp_port: 587
+          username: "your-email@gmail.com"
+          password: "your-password"
+        
+        webhook:
+          enabled: true
+          url: "https://hooks.slack.com/services/xxx"
+          events: ["config_change", "deploy_success", "deploy_failed"]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: git-watcher-secrets
+  namespace: nokube-system
+type: Opaque
+data:
+  github-token: <base64-encoded-github-token>
+  ssh-key: <base64-encoded-ssh-private-key>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: git-watcher-data
+  namespace: nokube-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi 

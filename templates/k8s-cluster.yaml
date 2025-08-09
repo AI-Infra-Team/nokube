@@ -1,0 +1,356 @@
+# Kubernetes 集群配置模板
+# 用于创建和管理 Kubernetes 生产环境集群
+
+# Kubernetes 集群规格配置
+k8s_spec:
+  # Kubernetes 版本
+  version: "1.27.3"
+  
+  # 集群配置
+  cluster_name: "k8s-cluster"
+  cluster_domain: "cluster.local"
+  
+  # 网络配置
+  network:
+    service_cidr: "10.96.0.0/12"
+    pod_cidr: "10.244.0.0/16"
+    dns_domain: "cluster.local"
+  
+  # 资源限制
+  resources:
+    cpu_limit: "auto"
+    memory_limit: "auto"
+    storage_limit: "auto"
+  
+  # 存储配置
+  storage:
+    type: "local"  # local, nfs, ceph
+    path: "/opt/nokube/data/k8s"
+    backup_enabled: true
+    backup_retention_days: 7
+
+# 节点配置列表
+nodes:
+  # Master 节点配置
+  - ssh_url: "localhost:22"
+    name: "k8s-master-1"
+    role: "master"
+    
+    # Kubernetes 配置
+    k8s_config:
+      api_server_port: 6443
+      etcd_port: 2379
+      controller_manager_port: 10257
+      scheduler_port: 10259
+      kubelet_port: 10250
+      kube_proxy_port: 10256
+    
+    # 系统配置
+    system:
+      os: "ubuntu"
+      version: "22.04"
+      kernel: "5.15.0"
+      cpus: 4
+      memory: "8Gi"
+      storage: "100Gi"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/k8s/master"
+      size: "50Gi"
+    
+    # 用户配置
+    users:
+      - userid: "k8s-admin"
+        password: "k8s123"
+        role: "admin"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+      - userid: "k8s-user"
+        password: "user123"
+        role: "user"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.10"
+      external_ip: "10.0.0.10"
+      interface: "eth0"
+      firewall_rules:
+        - port: 6443
+          protocol: "tcp"
+          description: "Kubernetes API Server"
+        - port: 2379
+          protocol: "tcp"
+          description: "etcd"
+        - port: 10257
+          protocol: "tcp"
+          description: "Controller Manager"
+        - port: 10259
+          protocol: "tcp"
+          description: "Scheduler"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8080
+      log_level: "INFO"
+  
+  # Worker 节点配置
+  - ssh_url: "localhost:22"
+    name: "k8s-worker-1"
+    role: "worker"
+    
+    # Kubernetes 配置
+    k8s_config:
+      kubelet_port: 10250
+      kube_proxy_port: 10256
+    
+    # 系统配置
+    system:
+      os: "ubuntu"
+      version: "22.04"
+      kernel: "5.15.0"
+      cpus: 8
+      memory: "16Gi"
+      storage: "200Gi"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/k8s/worker-1"
+      size: "100Gi"
+    
+    # 用户配置
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+        role: "worker"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+      - userid: "deploy"
+        password: "deploy123"
+        role: "deploy"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.11"
+      external_ip: "10.0.0.11"
+      interface: "eth0"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8081
+      log_level: "INFO"
+  
+  # 第二个 Worker 节点配置
+  - ssh_url: "localhost:22"
+    name: "k8s-worker-2"
+    role: "worker"
+    
+    # Kubernetes 配置
+    k8s_config:
+      kubelet_port: 10250
+      kube_proxy_port: 10256
+    
+    # 系统配置
+    system:
+      os: "ubuntu"
+      version: "22.04"
+      kernel: "5.15.0"
+      cpus: 16
+      memory: "32Gi"
+      storage: "500Gi"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/k8s/worker-2"
+      size: "200Gi"
+    
+    # 用户配置
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+        role: "worker"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+      - userid: "deploy"
+        password: "deploy123"
+        role: "deploy"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.12"
+      external_ip: "10.0.0.12"
+      interface: "eth0"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8082
+      log_level: "INFO"
+
+# 集群安全配置
+security:
+  # TLS 配置
+  tls:
+    enabled: true
+    cert_file: "/etc/kubernetes/pki/apiserver.crt"
+    key_file: "/etc/kubernetes/pki/apiserver.key"
+    ca_file: "/etc/kubernetes/pki/ca.crt"
+  
+  # RBAC 配置
+  rbac:
+    enabled: true
+    admin_users:
+      - "k8s-admin"
+    service_accounts:
+      - name: "default"
+        namespace: "default"
+  
+  # 网络策略配置
+  network_policy:
+    enabled: true
+    default_policy: "deny"
+    allowed_ports:
+      - port: 80
+        protocol: "tcp"
+      - port: 443
+        protocol: "tcp"
+  
+  # 防火墙配置
+  firewall:
+    enabled: true
+    rules:
+      - port: 6443
+        protocol: "tcp"
+        source: "0.0.0.0/0"
+        description: "Kubernetes API Server"
+      - port: 2379
+        protocol: "tcp"
+        source: "192.168.1.0/24"
+        description: "etcd"
+
+# 备份和恢复配置
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # 每天凌晨2点
+  retention_days: 7
+  storage:
+    type: "local"
+    path: "/opt/nokube/backups/k8s"
+  components:
+    - "etcd"
+    - "config"
+    - "secrets"
+
+# 监控和日志配置
+monitoring:
+  # 日志配置
+  logging:
+    level: "INFO"
+    format: "json"
+    retention_days: 30
+    components:
+      - "kube-apiserver"
+      - "kube-controller-manager"
+      - "kube-scheduler"
+      - "kubelet"
+      - "kube-proxy"
+  
+  # 指标配置
+  metrics:
+    enabled: true
+    port: 8080
+    exporters:
+      - type: "prometheus"
+        endpoint: "/metrics"
+      - type: "node-exporter"
+        port: 9100
+  
+  # 告警配置
+  alerts:
+    enabled: true
+    rules:
+      - name: "high_cpu_usage"
+        condition: "cpu_usage > 80"
+        duration: "5m"
+        severity: "warning"
+      - name: "high_memory_usage"
+        condition: "memory_usage > 85"
+        duration: "5m"
+        severity: "critical"
+      - name: "node_not_ready"
+        condition: "node_status != 'Ready'"
+        duration: "1m"
+        severity: "critical"
+
+# 部署配置
+deployment:
+  # 自动部署配置
+  auto_deploy: true
+  
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval: "30s"
+    timeout: "10s"
+    retries: 3
+  
+  # 滚动更新配置
+  rolling_update:
+    enabled: true
+    max_unavailable: 1
+    max_surge: 1
+  
+  # 初始化配置
+  init:
+    # 容器运行时配置
+    container_runtime: "containerd"
+    runtime_endpoint: "unix:///run/containerd/containerd.sock"
+    
+    # CNI 配置
+    cni: "flannel"
+    cni_config:
+      network: "10.244.0.0/16"
+      subnet_len: 24
+    
+    # DNS 配置
+    dns:
+      type: "CoreDNS"
+      cluster_ip: "10.96.0.10"
+      domain: "cluster.local"
+
+# 插件配置
+plugins:
+  # 网络插件
+  network:
+    name: "flannel"
+    version: "v0.22.0"
+    config:
+      network: "10.244.0.0/16"
+      subnet_len: 24
+      backend: "vxlan"
+  
+  # DNS 插件
+  dns:
+    name: "coredns"
+    version: "1.10.1"
+    replicas: 2
+  
+  # 监控插件
+  monitoring:
+    name: "prometheus"
+    version: "2.45.0"
+    enabled: true
+  
+  # 日志插件
+  logging:
+    name: "fluentd"
+    version: "1.16.0"
+    enabled: true
+  
+  # 存储插件
+  storage:
+    name: "local-path-provisioner"
+    version: "v0.0.24"
+    enabled: true 

@@ -1,0 +1,29 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include install.sh
+
+recursive-include src *.py
+recursive-include examples *.yaml *.yml *.py *.md
+recursive-include docs *.md *.rst *.txt
+recursive-include data *.yaml *.yml *.json
+recursive-include tests *.py *.yaml *.yml
+
+recursive-exclude * __pycache__
+recursive-exclude * *.pyc
+recursive-exclude * *.pyo
+recursive-exclude * *.pyd
+recursive-exclude * .git
+recursive-exclude * .gitignore
+recursive-exclude * .DS_Store
+recursive-exclude * .vscode
+recursive-exclude * .idea
+recursive-exclude * *.log
+recursive-exclude * *.tmp
+recursive-exclude * *.bak
+recursive-exclude * *.swp
+recursive-exclude * *.swo
+recursive-exclude * *~
+recursive-exclude * .env
+recursive-exclude * .env.local
+recursive-exclude * .env.*.local 

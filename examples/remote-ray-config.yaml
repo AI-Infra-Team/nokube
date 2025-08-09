@@ -1,0 +1,89 @@
+# 远程 Ray 集群配置示例
+# 演示如何配置多节点 Ray 集群
+
+# Ray 特有配置
+ray_spec:
+  dashboard_port: 8265
+  max_workers: 10
+
+# 节点列表
+nodes:
+  # Head 节点 - 生产环境
+  - ssh_url: "prod-server-1:22"
+    name: "ray-head-prod"
+    role: "head"
+    ray_config:
+      port: 10001
+      dashboard_port: 8265
+      num_cpus: 8
+      object_store_memory: 2000000000
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/head"
+    users:
+      - userid: "prod-admin"
+        password: "prod123"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+    
+  # Worker 节点 1 - 生产环境
+  - ssh_url: "prod-server-2:22"
+    name: "ray-worker-1"
+    role: "worker"
+    ray_config:
+      num_cpus: 16
+      object_store_memory: 4000000000
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-1"
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+        
+  # Worker 节点 2 - 生产环境
+  - ssh_url: "prod-server-3:22"
+    name: "ray-worker-2"
+    role: "worker"
+    ray_config:
+      num_cpus: 16
+      object_store_memory: 4000000000
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-2"
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+
+# 本地开发环境配置示例
+# nodes:
+#   - ssh_url: "localhost:10001"
+#     name: "ray-head-local"
+#     role: "head"
+#     ray_config:
+#       port: 10001
+#       dashboard_port: 8265
+#       num_cpus: 4
+#       object_store_memory: 1000000000
+#     storage:
+#       type: "local"
+#       path: "/tmp/nokube/data/ray/head"
+#     users:
+#       - userid: "local-user"
+#         password: "local123"
+#   
+#   - ssh_url: "localhost:10002"
+#     name: "ray-worker-local"
+#     role: "worker"
+#     ray_config:
+#       num_cpus: 2
+#       object_store_memory: 500000000
+#     storage:
+#       type: "local"
+#       path: "/tmp/nokube/data/ray/worker"
+#     users:
+#       - userid: "local-user"
+#         password: "local123" 

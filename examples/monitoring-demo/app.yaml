@@ -1,0 +1,387 @@
+# NoKube 监控演示应用
+# 展示完整的部署和监控功能
+
+# 应用基本信息
+app:
+  name: "monitoring-demo"
+  version: "1.0.0"
+  description: "NoKube 监控和部署演示应用"
+
+# 部署配置
+deployments:
+  # Ray Job 部署
+  - name: "data-processing-job"
+    type: "ray_job"
+    entrypoint: "python data_processor.py"
+    runtime_env:
+      pip:
+        - "pandas>=1.5.0"
+        - "numpy>=1.21.0"
+        - "matplotlib>=3.5.0"
+      env_vars:
+        DATASET_PATH: "/data/dataset.csv"
+        OUTPUT_PATH: "/output/results.csv"
+    resources:
+      cpu: 2
+      memory: "4Gi"
+    schedule: "0 2 * * *"  # 每天凌晨2点执行
+    
+  # Ray Service 部署
+  - name: "ml-inference-service"
+    type: "ray_service"
+    import_path: "ml_service:MLInferenceService"
+    runtime_env:
+      pip:
+        - "scikit-learn>=1.1.0"
+        - "torch>=1.12.0"
+        - "transformers>=4.20.0"
+    resources:
+      cpu: 4
+      memory: "8Gi"
+    replicas: 3
+    health_check:
+      enabled: true
+      endpoint: "/health"
+      interval: "30s"
+      timeout: "10s"
+    
+  # Ray Workflow 部署
+  - name: "ml-training-workflow"
+    type: "ray_workflow"
+    workflow_id: "ml-training-pipeline"
+    entrypoint: "python ml_training_workflow.py"
+    runtime_env:
+      pip:
+        - "ray[tune]>=2.7.0"
+        - "scikit-learn>=1.1.0"
+        - "optuna>=3.0.0"
+    resources:
+      cpu: 8
+      memory: "16Gi"
+    
+  # Ray Dataset 部署
+  - name: "data-pipeline"
+    type: "ray_dataset"
+    data_source: "s3://nokube-demo/data/"
+    format: "parquet"
+    transformations:
+      - type: "filter"
+        condition: "column_value > 0"
+      - type: "map"
+        function: "normalize_data"
+      - type: "batch"
+        size: 1000
+
+# 监控配置
+monitoring:
+  # 指标收集
+  metrics:
+    enabled: true
+    interval: "30s"
+    exporters:
+      - type: "prometheus"
+        endpoint: "/metrics"
+        port: 8080
+      - type: "json"
+        path: "/var/log/metrics.json"
+    
+  # 告警规则
+  alerts:
+    - name: "high_cpu_usage"
+      condition: "cpu_usage > 80"
+      duration: "5m"
+      severity: "warning"
+      notification:
+        type: "email"
+        recipients: ["admin@nokube.dev"]
+    
+    - name: "high_memory_usage"
+      condition: "memory_usage > 85"
+      duration: "5m"
+      severity: "critical"
+      notification:
+        type: "slack"
+        channel: "#alerts"
+    
+    - name: "service_unhealthy"
+      condition: "health_check_failed"
+      duration: "1m"
+      severity: "critical"
+      notification:
+        type: "pagerduty"
+        service_key: "your-service-key"
+    
+  # 日志配置
+  logging:
+    level: "INFO"
+    format: "json"
+    retention_days: 30
+    outputs:
+      - type: "file"
+        path: "/var/log/app.log"
+        max_size: "100MB"
+        max_files: 10
+      - type: "syslog"
+        facility: "local0"
+      - type: "elasticsearch"
+        hosts: ["localhost:9200"]
+        index: "nokube-logs"
+
+# 备份配置
+backup:
+  enabled: true
+  schedule: "0 1 * * *"  # 每天凌晨1点
+  retention_days: 7
+  storage:
+    type: "s3"
+    bucket: "nokube-backups"
+    path: "monitoring-demo/"
+  components:
+    - "data"
+    - "models"
+    - "configs"
+
+# 安全配置
+security:
+  # 认证
+  authentication:
+    type: "jwt"
+    secret: "your-jwt-secret"
+    expiration: "24h"
+  
+  # 授权
+  authorization:
+    enabled: true
+    roles:
+      - name: "admin"
+        permissions: ["read", "write", "delete"]
+      - name: "user"
+        permissions: ["read"]
+      - name: "viewer"
+        permissions: ["read"]
+  
+  # 网络策略
+  network_policy:
+    enabled: true
+    ingress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                name: "frontend"
+        ports:
+          - protocol: TCP
+            port: 8080
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                name: "database"
+        ports:
+          - protocol: TCP
+            port: 5432
+
+# 扩展配置
+scaling:
+  # 自动扩缩容
+  auto_scaling:
+    enabled: true
+    min_replicas: 1
+    max_replicas: 10
+    target_cpu_utilization: 70
+    target_memory_utilization: 80
+  
+  # 手动扩缩容
+  manual_scaling:
+    enabled: true
+    default_replicas: 3
+
+# 回滚配置
+rollback:
+  enabled: true
+  max_versions: 5
+  strategy: "rolling"
+  health_check:
+    enabled: true
+    timeout: "5m"
+    interval: "30s"
+
+# 资源限制
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+  storage:
+    requests:
+      storage: "10Gi"
+    limits:
+      storage: "100Gi"
+
+# 环境变量
+env:
+  - name: "NODE_ENV"
+    value: "production"
+  - name: "LOG_LEVEL"
+    value: "INFO"
+  - name: "DATABASE_URL"
+    valueFrom:
+      secretKeyRef:
+        name: "db-secret"
+        key: "url"
+  - name: "API_KEY"
+    valueFrom:
+      secretKeyRef:
+        name: "api-secret"
+        key: "key"
+
+# 配置映射
+config_maps:
+  - name: "app-config"
+    data:
+      app.json: |
+        {
+          "debug": false,
+          "timeout": 30,
+          "retries": 3
+        }
+      logging.json: |
+        {
+          "level": "INFO",
+          "format": "json"
+        }
+
+# 密钥
+secrets:
+  - name: "db-secret"
+    data:
+      username: "admin"
+      password: "secret123"
+      url: "postgresql://admin:secret123@db:5432/app"
+  
+  - name: "api-secret"
+    data:
+      key: "your-api-key-here"
+      token: "your-token-here"
+
+# 持久化存储
+volumes:
+  - name: "data-volume"
+    type: "persistent"
+    size: "100Gi"
+    access_mode: "ReadWriteMany"
+    storage_class: "fast-ssd"
+    mount_path: "/data"
+  
+  - name: "logs-volume"
+    type: "persistent"
+    size: "50Gi"
+    access_mode: "ReadWriteOnce"
+    storage_class: "standard"
+    mount_path: "/var/log"
+
+# 服务发现
+services:
+  - name: "ml-inference-service"
+    type: "ClusterIP"
+    port: 8080
+    target_port: 8080
+    protocol: "TCP"
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+  
+  - name: "data-processing-job"
+    type: "Job"
+    completions: 1
+    parallelism: 1
+    backoff_limit: 3
+
+# 网络策略
+network_policies:
+  - name: "allow-frontend"
+    pod_selector:
+      matchLabels:
+        app: "frontend"
+    policy_types:
+      - "Ingress"
+    ingress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                name: "frontend"
+        ports:
+          - protocol: "TCP"
+            port: 8080
+
+# 资源配额
+resource_quotas:
+  - name: "compute-quota"
+    hard:
+      requests.cpu: "4"
+      requests.memory: "8Gi"
+      limits.cpu: "8"
+      limits.memory: "16Gi"
+      requests.storage: "100Gi"
+      persistentvolumeclaims: "10"
+      services: "10"
+      services.loadbalancers: "2"
+
+# 优先级类
+priority_classes:
+  - name: "high-priority"
+    value: 1000000
+    global_default: false
+    description: "高优先级任务"
+  
+  - name: "low-priority"
+    value: 100000
+    global_default: true
+    description: "低优先级任务"
+
+# 节点选择器
+node_selectors:
+  - key: "node-role"
+    operator: "In"
+    values:
+      - "worker"
+  
+  - key: "gpu"
+    operator: "Exists"
+
+# 容忍度
+tolerations:
+  - key: "node-role"
+    operator: "Equal"
+    value: "worker"
+    effect: "NoSchedule"
+  
+  - key: "gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+# 亲和性
+affinities:
+  pod_affinity:
+    preferred_during_scheduling_ignored_during_execution:
+      - weight: 100
+        pod_affinity_term:
+          label_selector:
+            match_expressions:
+              - key: "app"
+                operator: "In"
+                values:
+                  - "ml-inference-service"
+          topology_key: "kubernetes.io/hostname"
+  
+  pod_anti_affinity:
+    required_during_scheduling_ignored_during_execution:
+      - label_selector:
+          match_expressions:
+            - key: "app"
+              operator: "In"
+              values:
+                - "ml-inference-service"
+        topology_key: "kubernetes.io/hostname" 

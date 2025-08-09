@@ -1,0 +1,231 @@
+# Ray 集群配置模板
+# 用于创建和管理 Ray 分布式计算集群
+
+# Ray 集群规格配置
+ray_spec:
+  # Ray 版本
+  version: "2.8.0"
+  
+  # 集群配置
+  dashboard_port: 8265
+  max_workers: 10
+  
+  # 资源限制
+  resources:
+    cpu_limit: "auto"  # 自动检测或指定数量
+    memory_limit: "auto"  # 自动检测或指定大小 (如 "8Gi")
+    gpu_limit: 0  # GPU 数量
+  
+  # 存储配置
+  storage:
+    type: "local"  # local, nfs, s3
+    path: "/opt/nokube/data/ray"
+    backup_enabled: true
+    backup_retention_days: 7
+
+# 节点配置列表
+nodes:
+  # Head 节点配置
+  - ssh_url: "localhost:22"
+    name: "ray-head-node"
+    role: "head"
+    
+    # Ray 配置
+    ray_config:
+      port: 10001
+      dashboard_port: 8265
+      num_cpus: 4
+      object_store_memory: 2000000000  # 2GB
+      temp_dir: "/tmp/ray"
+      log_dir: "/var/log/ray"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/head"
+      size: "10Gi"
+    
+    # 用户配置
+    users:
+      - userid: "ray-admin"
+        password: "ray123"
+        role: "admin"
+      - userid: "ray-user"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+        role: "user"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.100"
+      external_ip: "10.0.0.100"
+      firewall_rules:
+        - port: 10001
+          protocol: "tcp"
+          description: "Ray head port"
+        - port: 8265
+          protocol: "tcp"
+          description: "Ray dashboard"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8080
+      log_level: "INFO"
+  
+  # Worker 节点配置
+  - ssh_url: "localhost:22"
+    name: "ray-worker-1"
+    role: "worker"
+    
+    # Ray 配置
+    ray_config:
+      num_cpus: 8
+      object_store_memory: 4000000000  # 4GB
+      temp_dir: "/tmp/ray"
+      log_dir: "/var/log/ray"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-1"
+      size: "20Gi"
+    
+    # 用户配置
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+        role: "worker"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+        role: "deploy"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.101"
+      external_ip: "10.0.0.101"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8081
+      log_level: "INFO"
+  
+  # 第二个 Worker 节点配置
+  - ssh_url: "localhost:22"
+    name: "ray-worker-2"
+    role: "worker"
+    
+    # Ray 配置
+    ray_config:
+      num_cpus: 16
+      object_store_memory: 8000000000  # 8GB
+      temp_dir: "/tmp/ray"
+      log_dir: "/var/log/ray"
+    
+    # 存储配置
+    storage:
+      type: "local"
+      path: "/opt/nokube/data/ray/worker-2"
+      size: "50Gi"
+    
+    # 用户配置
+    users:
+      - userid: "worker-user"
+        password: "worker123"
+        role: "worker"
+      - userid: "deploy"
+        sshkey: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+        role: "deploy"
+    
+    # 网络配置
+    network:
+      internal_ip: "192.168.1.102"
+      external_ip: "10.0.0.102"
+    
+    # 监控配置
+    monitoring:
+      enabled: true
+      metrics_port: 8082
+      log_level: "INFO"
+
+# 集群安全配置
+security:
+  # TLS 配置
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+  
+  # 认证配置
+  authentication:
+    type: "password"  # password, sshkey, oauth
+    enabled: true
+  
+  # 防火墙配置
+  firewall:
+    enabled: true
+    rules:
+      - port: 10001
+        protocol: "tcp"
+        source: "0.0.0.0/0"
+        description: "Ray head port"
+      - port: 8265
+        protocol: "tcp"
+        source: "0.0.0.0/0"
+        description: "Ray dashboard"
+
+# 备份和恢复配置
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # 每天凌晨2点
+  retention_days: 7
+  storage:
+    type: "local"
+    path: "/opt/nokube/backups"
+
+# 监控和日志配置
+monitoring:
+  # 日志配置
+  logging:
+    level: "INFO"
+    format: "json"
+    retention_days: 30
+  
+  # 指标配置
+  metrics:
+    enabled: true
+    port: 8080
+    exporters:
+      - type: "prometheus"
+        endpoint: "/metrics"
+  
+  # 告警配置
+  alerts:
+    enabled: true
+    rules:
+      - name: "high_cpu_usage"
+        condition: "cpu_usage > 80"
+        duration: "5m"
+        severity: "warning"
+      - name: "high_memory_usage"
+        condition: "memory_usage > 85"
+        duration: "5m"
+        severity: "critical"
+
+# 部署配置
+deployment:
+  # 自动部署配置
+  auto_deploy: true
+  
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval: "30s"
+    timeout: "10s"
+    retries: 3
+  
+  # 滚动更新配置
+  rolling_update:
+    enabled: true
+    max_unavailable: 1
+    max_surge: 1 
