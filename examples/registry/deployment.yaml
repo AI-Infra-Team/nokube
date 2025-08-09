@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: default
+  labels:
+    app: registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:2
+          ports:
+            - containerPort: 5000
+              name: http
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /var/lib/registry
+            - name: REGISTRY_HTTP_ADDR
+              value: :5000
+            - name: REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin
+              value: '*'
+            - name: REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods
+              value: 'HEAD,GET,OPTIONS,DELETE,PUT,POST'
+            - name: REGISTRY_HTTP_HEADERS_Access-Control-Allow-Headers
+              value: 'Authorization,Accept,Cache-Control'
+            - name: REGISTRY_AUTH
+              value: htpasswd
+            - name: REGISTRY_AUTH_HTPASSWD_REALM
+              value: 'Registry Realm'
+            - name: REGISTRY_AUTH_HTPASSWD_PATH
+              value: /auth/htpasswd
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: registry-data
+        - name: auth
+          secret:
+            secretName: registry-basic-auth
+            items:
+              - key: htpasswd
+                path: htpasswd
+
+

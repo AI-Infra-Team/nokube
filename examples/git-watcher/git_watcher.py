@@ -20,6 +20,13 @@ from rich.panel import Panel
 
 console = Console()
 
+try:
+    # 同目录导入
+    from auto_deployer import AutoDeployer
+    from config_scanner import ConfigScanner
+except Exception:
+    # 作为模块运行时的兜底（例如通过启动器调用）
+    pass
 
 class GitWatcher:
     """Git 仓库监控器"""
@@ -63,7 +70,7 @@ class GitWatcher:
             console.print(f"⚠️  保存状态失败: {e}", style="yellow")
     
     def _get_repo_hash(self, repo_name: str, config_path: str) -> str:
-        """获取仓库配置文件的哈希值"""
+        """获取仓库配置路径（文件或目录）的哈希值"""
         try:
             # 克隆或更新仓库
             repo_dir = f"./repos/{repo_name}"
@@ -74,12 +81,28 @@ class GitWatcher:
             else:
                 self._pull_repo(repo_config)
             
-            # 计算配置文件哈希
-            config_file = os.path.join(repo_dir, config_path)
-            if os.path.exists(config_file):
-                with open(config_file, 'rb') as f:
-                    content = f.read()
-                return hashlib.md5(content).hexdigest()
+            config_root = os.path.join(repo_dir, config_path)
+            # 支持目录：聚合目录下所有 yaml/yml 文件
+            if os.path.isdir(config_root):
+                digest = hashlib.md5()
+                for root, _, files in os.walk(config_root):
+                    for fname in sorted(files):
+                        if fname.endswith(('.yaml', '.yml')):
+                            fpath = os.path.join(root, fname)
+                            try:
+                                with open(fpath, 'rb') as f:
+                                    content = f.read()
+                                digest.update(fpath.encode('utf-8'))
+                                digest.update(content)
+                            except Exception:
+                                continue
+                return digest.hexdigest()
+            else:
+                # 单文件
+                if os.path.exists(config_root):
+                    with open(config_root, 'rb') as f:
+                        content = f.read()
+                    return hashlib.md5(content).hexdigest()
             
         except Exception as e:
             console.print(f"❌ 获取仓库哈希失败 {repo_name}: {e}", style="red")
@@ -104,15 +127,41 @@ class GitWatcher:
         
         # 设置认证
         if repo_config.get('auth', {}).get('type') == 'ssh':
-            # SSH 认证
-            key_path = repo_config['auth']['key_path']
+            # SSH 认证：优先 key_path，否则支持内联 ssh_key（写入临时文件）
+            auth_cfg = repo_config.get('auth', {})
+            key_path = auth_cfg.get('key_path')
+            if not key_path:
+                inline_key = auth_cfg.get('ssh_key') or auth_cfg.get('ssh_key_inline')
+                if inline_key:
+                    repo_tmp_dir = os.path.join('/tmp', 'git-watcher', repo_name)
+                    os.makedirs(repo_tmp_dir, exist_ok=True)
+                    key_path = os.path.join(repo_tmp_dir, 'id_rsa')
+                    try:
+                        with open(key_path, 'w', encoding='utf-8') as kf:
+                            kf.write(inline_key.strip() + ("\n" if not inline_key.endswith("\n") else ""))
+                        os.chmod(key_path, 0o600)
+                    except Exception as e:
+                        raise RuntimeError(f"写入内联 SSH Key 失败: {e}")
+                else:
+                    raise ValueError("SSH 认证需要提供 auth.key_path 或 auth.ssh_key")
             env = os.environ.copy()
-            env['GIT_SSH_COMMAND'] = f'ssh -i {key_path}'
+            env['GIT_SSH_COMMAND'] = f'ssh -i {key_path} -o StrictHostKeyChecking=no'
         else:
-            # HTTPS 认证
-            token = os.environ.get('GITHUB_TOKEN')
+            # HTTPS 认证（优先直接 token，其次 token_path 文件；均不使用环境变量）
+            auth_cfg = repo_config.get('auth', {})
+            token = auth_cfg.get('token')
+            if not token:
+                token_path = auth_cfg.get('token_path', '/app/ssh/github-token')
+                try:
+                    if token_path and os.path.exists(token_path):
+                        with open(token_path, 'r', encoding='utf-8') as tf:
+                            token = tf.read().strip()
+                except Exception:
+                    token = None
             if token:
-                repo_url = repo_url.replace('https://', f'https://{token}@')
+                # 直接临时拼接到 URL（注意避免日志打印）
+                if repo_url.startswith('https://'):
+                    repo_url = repo_url.replace('https://', f'https://{token}@', 1)
             env = os.environ.copy()
         
         # 克隆仓库
@@ -132,10 +181,26 @@ class GitWatcher:
         
         # 设置认证
         if repo_config.get('auth', {}).get('type') == 'ssh':
-            key_path = repo_config['auth']['key_path']
+            auth_cfg = repo_config.get('auth', {})
+            key_path = auth_cfg.get('key_path')
+            if not key_path:
+                inline_key = auth_cfg.get('ssh_key') or auth_cfg.get('ssh_key_inline')
+                if inline_key:
+                    repo_tmp_dir = os.path.join('/tmp', 'git-watcher', repo_name)
+                    os.makedirs(repo_tmp_dir, exist_ok=True)
+                    key_path = os.path.join(repo_tmp_dir, 'id_rsa')
+                    try:
+                        with open(key_path, 'w', encoding='utf-8') as kf:
+                            kf.write(inline_key.strip() + ("\n" if not inline_key.endswith("\n") else ""))
+                        os.chmod(key_path, 0o600)
+                    except Exception as e:
+                        raise RuntimeError(f"写入内联 SSH Key 失败: {e}")
+                else:
+                    raise ValueError("SSH 认证需要提供 auth.key_path 或 auth.ssh_key")
             env = os.environ.copy()
-            env['GIT_SSH_COMMAND'] = f'ssh -i {key_path}'
+            env['GIT_SSH_COMMAND'] = f'ssh -i {key_path} -o StrictHostKeyChecking=no'
         else:
+            # HTTPS 拉取（尽量复用已存在的远程凭据；不通过环境变量传递）
             env = os.environ.copy()
         
         # 拉取更新
@@ -149,7 +214,13 @@ class GitWatcher:
     def _check_repo_changes(self, repo_name: str) -> bool:
         """检查仓库是否有变更"""
         repo_config = self._get_repo_config(repo_name)
-        config_path = repo_config['config_path']
+        # 兼容旧字段 config_path；推荐使用 path（目录）
+        config_path = (
+            repo_config.get('path')
+            or repo_config.get('config_path')
+        )
+        if not config_path:
+            raise ValueError(f"仓库 {repo_name} 缺少 path/config_path 配置")
         
         # 获取当前哈希
         current_hash = self._get_repo_hash(repo_name, config_path)
@@ -171,6 +242,50 @@ class GitWatcher:
             return True
         
         return False
+
+    def _list_yaml_files(self, repo_name: str, path_value: str) -> list:
+        """列出仓库路径下的 YAML 文件（支持文件或目录）"""
+        repo_dir = f"./repos/{repo_name}"
+        full_path = os.path.join(repo_dir, path_value)
+        files = []
+        if os.path.isdir(full_path):
+            for root, _, fnames in os.walk(full_path):
+                for fname in sorted(fnames):
+                    if fname.endswith(('.yaml', '.yml')):
+                        files.append(os.path.join(root, fname))
+        else:
+            if os.path.exists(full_path) and full_path.endswith(('.yaml', '.yml')):
+                files.append(full_path)
+        return files
+
+    def _load_repo_configs(self, repo_name: str) -> list:
+        """加载并解析仓库中的 YAML 配置，返回配置对象列表"""
+        try:
+            repo_config = self._get_repo_config(repo_name)
+            path_value = repo_config.get('path') or repo_config.get('config_path')
+            if not path_value:
+                return []
+            yaml_files = self._list_yaml_files(repo_name, path_value)
+            configs = []
+            scanner = ConfigScanner() if 'ConfigScanner' in globals() else None
+            for fpath in yaml_files:
+                try:
+                    if scanner:
+                        scanned = scanner.scan_config_file(fpath)
+                        configs.extend(scanned.values())
+                    else:
+                        # 简单解析以兜底
+                        with open(fpath, 'r', encoding='utf-8') as f:
+                            documents = list(yaml.safe_load_all(f))
+                        for doc in documents:
+                            if isinstance(doc, dict) and 'kind' in doc:
+                                configs.append(doc)
+                except Exception:
+                    continue
+            return configs
+        except Exception as e:
+            console.print(f"❌ 加载仓库配置失败 {repo_name}: {e}", style="red")
+            return []
     
     def deploy_config_change(self, repo_name: str, config_data: Dict[str, Any], target_cluster: str):
         """部署配置变更"""
@@ -187,10 +302,12 @@ class GitWatcher:
                 deployment_target = 'ray'
             
             # 创建部署器
-            deployer = AutoDeployer()
+            deployer = AutoDeployer() if 'AutoDeployer' in globals() else None
             
             # 部署到目标集群
-            success = deployer.deploy_to_target(repo_name, config_data, deployment_target)
+            success = False
+            if deployer:
+                success = deployer.deploy_to_target(repo_name, config_data, deployment_target)
             
             if success:
                 console.print(f"✅ 配置变更部署成功: {repo_name}", style="green")
@@ -203,8 +320,12 @@ class GitWatcher:
     def _send_notification(self, message: str):
         """发送通知"""
         try:
-            webhook_config = self.config['global']['notifications']['webhook']
-            if webhook_config.get('enabled'):
+            webhook_config = (
+                self.config.get('global', {})
+                .get('notifications', {})
+                .get('webhook', {})
+            )
+            if webhook_config and webhook_config.get('enabled'):
                 # 这里可以集成 Slack、钉钉等通知
                 console.print(f"📢 通知: {message}", style="cyan")
         except Exception as e:
@@ -220,7 +341,15 @@ class GitWatcher:
         while self.running:
             try:
                 if self._check_repo_changes(repo_name):
-                    self._deploy_config_change(repo_name)
+                    # 解析配置并逐条部署
+                    repo_cfg = self._get_repo_config(repo_name)
+                    target_cluster = repo_cfg.get('target_cluster', 'default')
+                    configs = self._load_repo_configs(repo_name)
+                    if not configs:
+                        console.print(f"⚠️ {repo_name} 未发现可部署配置", style="yellow")
+                    for cfg in configs:
+                        # cfg 可能来自扫描器（已拆解），也可能是原始 K8s 文档
+                        self.deploy_config_change(repo_name, cfg, target_cluster)
                 
                 time.sleep(check_interval)
                 

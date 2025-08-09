@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sing-box
+  labels:
+    app: sing-box
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sing-box
+  template:
+    metadata:
+      labels:
+        app: sing-box
+    spec:
+      containers:
+        - name: sing-box
+          image: ghcr.io/sagernet/sing-box:latest
+          args: ["run", "-c", "/etc/sing-box/config.json"]
+          ports:
+            - containerPort: 1080
+              name: socks
+            - containerPort: 7890
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sing-box
+              readOnly: true
+          securityContext:
+            runAsUser: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config
+          configMap:
+            name: sing-box-config
+            items:
+              - key: config.json
+                path: config.json
+
+
+

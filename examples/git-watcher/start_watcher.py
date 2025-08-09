@@ -20,7 +20,9 @@ console = Console()
 
 def main():
     parser = argparse.ArgumentParser(description='启动 Git 仓库监控服务')
-    parser.add_argument('--config', default='repos.yaml', help='配置文件路径')
+    # 默认从环境变量 CONFIG_PATH 读取，未设置则回退到 repos.yaml
+    default_config = os.environ.get('CONFIG_PATH', 'repos.yaml')
+    parser.add_argument('--config', default=default_config, help='配置文件路径')
     parser.add_argument('--daemon', action='store_true', help='以守护进程模式运行')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='日志级别')
     
@@ -30,6 +32,7 @@ def main():
     os.environ['LOG_LEVEL'] = args.log_level
     
     console.print("🚀 启动 Git 仓库监控服务", style="blue")
+    console.print(f"使用配置: {config_file}", style="cyan")
     
     # 检查配置文件
     config_file = args.config
