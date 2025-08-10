@@ -24,6 +24,8 @@ class SSHManager:
         self.client = None
         self.sftp = None
         self.password: Optional[str] = None
+        # 记录已成功完成 sudo 免密 ensure 的目标，键为 "username@host:port"
+        self._ensured_targets: set[str] = set()
     
     def connect(self, host: str, port: int = 22, username: str = None, password: str = None, key_filename: str = None) -> bool:
         """建立 SSH 连接"""
@@ -45,10 +47,47 @@ class SSHManager:
             self.sftp = self.client.open_sftp()
             
             console.print(f"✅ SSH 连接到 {host}:{port} 成功", style="green")
+            # 首次访问该目标用户时，尝试确保 sudo 免密（lazy ensure）
+            self._lazy_ensure_passwordless_sudo(host=host, port=port, username=username)
             return True
             
         except Exception as e:
             console.print(f"❌ SSH 连接失败: {e}", style="red")
+            return False
+
+    def _lazy_ensure_passwordless_sudo(self, host: str, port: int, username: Optional[str] = None) -> bool:
+        """在首次连接某个 user@host:port 时，尝试确保 sudo 免密。
+
+        不抛出异常：失败仅记录日志并返回 False，不影响后续流程。
+        """
+        try:
+            if not self.client:
+                return False
+
+            target_username = username
+            if not target_username:
+                stdin, stdout, stderr = self.client.exec_command("whoami", get_pty=False)
+                who = (stdout.read().decode("utf-8") or "").strip() or "unknown"
+                _ = stderr.read()
+                _ = stdout.channel.recv_exit_status()
+                target_username = who
+
+            target_key = f"{target_username}@{host}:{port}"
+            if target_key in self._ensured_targets:
+                return True
+
+            ensured_ok = self.ensure_passwordless_sudo(target_username=target_username)
+            if ensured_ok:
+                self._ensured_targets.add(target_key)
+                return True
+
+            console.print(
+                f"⚠️  sudo 免密 ensure 未完成（将于后续有密码时再试）: {target_key}",
+                style="yellow",
+            )
+            return False
+        except Exception as _e:
+            logging.debug(f"lazy ensure_passwordless_sudo failed: {_e}")
             return False
     
     def disconnect(self):
