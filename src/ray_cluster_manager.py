@@ -11,6 +11,7 @@ import os
 import tempfile
 import shutil
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 from rich.console import Console
 from rich.table import Table
@@ -30,6 +31,8 @@ class RayClusterManager(ClusterManager):
         self.worker_nodes = []
         self.remote_lib_path = Path(__file__).parent / "remote_lib"
         self.remote_executor = RemoteExecutor()
+        # 本进程内去重：同一节点在一次启动流程中只尝试确保一次 NodeConfigActor
+        self._nodecfg_ensured: set[str] = set()
     
     def start_cluster(self, config: Dict[str, Any] = None, **kwargs) -> bool:
         """启动 Ray 集群"""
@@ -40,6 +43,20 @@ class RayClusterManager(ClusterManager):
             
             console.print("🚀 启动 Ray 集群", style="blue")
             
+            # 解析配置：读取由上游注入的 etcd 元数据，供后续节点代理配置使用
+            try:
+                self.current_cluster_metadata = config.get('_nokube_metadata', {}) if isinstance(config, dict) else {}
+            except Exception:
+                self.current_cluster_metadata = {}
+            # 读取变更摘要，决定是否需要重启
+            change_summary = {}
+            requires_restart = False
+            try:
+                change_summary = self.current_cluster_metadata.get('change_summary', {}) if isinstance(self.current_cluster_metadata, dict) else {}
+                requires_restart = bool(change_summary.get('requires_restart'))
+            except Exception:
+                pass
+
             # 解析配置
             nodes = config.get('nodes', [])
             if not nodes:
@@ -62,6 +79,17 @@ class RayClusterManager(ClusterManager):
             
             # 启动 head 节点
             console.print(f"🎯 启动 head 节点: {head_node.get('name', 'unknown')}", style="blue")
+            if requires_restart:
+                # 优先尝试停止再启动，应用端口等需要重启的配置
+                try:
+                    host, ssh_port = self._parse_ssh_url(head_node.get('ssh_url'))
+                    user = (head_node.get('users') or [{}])[0]
+                    username = user.get('userid', 'root')
+                    password = user.get('password')
+                    # 使用已有执行器 stop
+                    self.remote_executor.execute_ray_command_with_logging(host, ssh_port, username, password, "stop", realtime_output=True, logtag=f"stop_head_{head_node.get('name','head')}")
+                except Exception:
+                    pass
             if not self._start_head_node(head_node):
                 console.print("❌ Head 节点启动失败", style="red")
                 return False
@@ -72,6 +100,15 @@ class RayClusterManager(ClusterManager):
             if worker_nodes:
                 console.print(f"🔧 启动 {len(worker_nodes)} 个 worker 节点", style="blue")
                 for worker in worker_nodes:
+                    if requires_restart:
+                        try:
+                            host, ssh_port = self._parse_ssh_url(worker.get('ssh_url'))
+                            user = (worker.get('users') or [{}])[0]
+                            username = user.get('userid', 'root')
+                            password = user.get('password')
+                            self.remote_executor.execute_ray_command_with_logging(host, ssh_port, username, password, "stop", realtime_output=True, logtag=f"stop_worker_{worker.get('name','worker')}")
+                        except Exception:
+                            pass
                     if not self._start_worker_node(worker, head_node):
                         console.print(f"⚠️  Worker 节点 {worker.get('name')} 启动失败", style="yellow")
             
@@ -104,10 +141,66 @@ class RayClusterManager(ClusterManager):
             username = user.get('userid', 'root')
             password = user.get('password')
             
+            # 解析代理配置并转换为环境变量（优先 etcd 元数据，其次节点内联）
+            proxy_cfg = head_node.get('proxy', {}) or {}
+            try:
+                etcd_meta = getattr(self, 'current_cluster_metadata', {}) or {}
+                meta_map = etcd_meta.get('node_proxy_env', {}) if isinstance(etcd_meta, dict) else {}
+                # 同时支持通过节点 name 查找
+                node_name = head_node.get('name')
+                if ssh_url in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(ssh_url) or {})}
+                if node_name and node_name in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(node_name) or {})}
+            except Exception:
+                pass
+            env = {}
+            for key in (
+                'http_proxy', 'https_proxy', 'no_proxy',
+                'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'
+            ):
+                if key in proxy_cfg and proxy_cfg.get(key):
+                    env[key] = proxy_cfg.get(key)
+            # 注入节点标识到环境，便于下游 Actor 解析
+            env['NOKUBE_NODE_NAME'] = head_node.get('name', '') or env.get('NOKUBE_NODE_NAME', '')
+            env['NOKUBE_NODE_SSH_URL'] = head_node.get('ssh_url', '') or env.get('NOKUBE_NODE_SSH_URL', '')
+
+            # 打印将使用的代理环境（脱敏显示值）
+            def _mask_proxy(k: str, v: str) -> str:
+                try:
+                    if k.lower() == 'no_proxy':
+                        items = [s.strip() for s in (v or '').split(',') if s.strip()]
+                        preview = ','.join(items[:5])
+                        suffix = '' if len(items) <= 5 else f" (+{len(items)-5})"
+                        return f"{k}={preview}{suffix}"
+                    parsed = urlparse(v)
+                    if parsed.scheme and (parsed.hostname or parsed.netloc):
+                        host = parsed.hostname or ''
+                        port = f":{parsed.port}" if parsed.port else ''
+                        return f"{k}={parsed.scheme}://{host}{port}"
+                    # 非 URL 形式，直接返回（截断过长值）
+                    sval = str(v)
+                    return f"{k}={sval[:120]}{'' if len(sval) <= 120 else '…'}"
+                except Exception:
+                    return f"{k}={v}"
+            masked = [
+                _mask_proxy(k, env.get(k))
+                for k in ('http_proxy','https_proxy','no_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY')
+                if env.get(k)
+            ]
+            if masked:
+                console.print(f"🌐 使用代理环境(HEAD): {', '.join(masked)}", style="cyan")
+
+            # 可选：为 Docker 守护进程配置代理，确保镜像拉取走代理（忽略失败继续）
+            try:
+                self.remote_executor.configure_docker_daemon_proxy(host, ssh_port, username, password, env)
+            except Exception:
+                pass
+
             # 上传远程执行库
-            if not self.remote_executor.upload_remote_lib(host, ssh_port, username, password, str(self.remote_lib_path)):
+            if not self.remote_executor.upload_remote_lib(host, ssh_port, username, password, str(self.remote_lib_path), env=env):
                 return False
-            
+
             # 在远程节点上启动 head
             ray_config = head_node.get('ray_config', {})
             ray_port = ray_config.get('port', 10001)
@@ -127,13 +220,30 @@ class RayClusterManager(ClusterManager):
             node_name = head_node.get('name', 'ray-head')
             success = self.remote_executor.execute_ray_command_with_logging(
                 host, ssh_port, username, password, "start-head", ray_args, 
-                realtime_output=True, logtag=f"head_{node_name}"
+                realtime_output=True, logtag=f"head_{node_name}", env=env
             )
             
             if success:
                 console.print("✅ Head 节点启动成功", style="green")
                 console.print(f"  Dashboard: http://{host}:{dashboard_port}", style="cyan")
                 self.head_node = head_node
+                # 现在 Ray 已启动，再确保 NodeConfigActor（后台常驻，幂等）
+                try:
+                    node_key = f"{username}@{host}:{ssh_port}"
+                    if node_key not in self._nodecfg_ensured:
+                        env_cfg = dict(env or {})
+                        # 指定 ray client 地址，避免本地 session 探测失败
+                        env_cfg['RAY_ADDRESS'] = f"ray://{host}:{int(ray_port)+1}"
+                        self.remote_executor.execute_ray_command_with_logging(
+                            host, ssh_port, username, password,
+                            "start-config-actor",
+                            realtime_output=True,
+                            logtag=f"config_{node_name}",
+                            env=env_cfg,
+                        )
+                        self._nodecfg_ensured.add(node_key)
+                except Exception:
+                    pass
                 return True
             else:
                 console.print("❌ Head 节点启动失败", style="red")
@@ -165,10 +275,64 @@ class RayClusterManager(ClusterManager):
             username = user.get('userid', 'root')
             password = user.get('password')
             
+            # 解析代理配置并转换为环境变量（优先 etcd 元数据，其次节点内联）
+            proxy_cfg = worker_node.get('proxy', {}) or {}
+            try:
+                etcd_meta = getattr(self, 'current_cluster_metadata', {}) or {}
+                meta_map = etcd_meta.get('node_proxy_env', {}) if isinstance(etcd_meta, dict) else {}
+                node_name = worker_node.get('name')
+                if ssh_url in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(ssh_url) or {})}
+                if node_name and node_name in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(node_name) or {})}
+            except Exception:
+                pass
+            env = {}
+            for key in (
+                'http_proxy', 'https_proxy', 'no_proxy',
+                'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'
+            ):
+                if key in proxy_cfg and proxy_cfg.get(key):
+                    env[key] = proxy_cfg.get(key)
+            # 注入节点标识
+            env['NOKUBE_NODE_NAME'] = worker_node.get('name', '') or env.get('NOKUBE_NODE_NAME', '')
+            env['NOKUBE_NODE_SSH_URL'] = worker_node.get('ssh_url', '') or env.get('NOKUBE_NODE_SSH_URL', '')
+
+            # 打印将使用的代理环境（脱敏显示值）
+            def _mask_proxy_w(k: str, v: str) -> str:
+                try:
+                    if k.lower() == 'no_proxy':
+                        items = [s.strip() for s in (v or '').split(',') if s.strip()]
+                        preview = ','.join(items[:5])
+                        suffix = '' if len(items) <= 5 else f" (+{len(items)-5})"
+                        return f"{k}={preview}{suffix}"
+                    parsed = urlparse(v)
+                    if parsed.scheme and (parsed.hostname or parsed.netloc):
+                        host = parsed.hostname or ''
+                        port = f":{parsed.port}" if parsed.port else ''
+                        return f"{k}={parsed.scheme}://{host}{port}"
+                    sval = str(v)
+                    return f"{k}={sval[:120]}{'' if len(sval) <= 120 else '…'}"
+                except Exception:
+                    return f"{k}={v}"
+            masked_w = [
+                _mask_proxy_w(k, env.get(k))
+                for k in ('http_proxy','https_proxy','no_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY')
+                if env.get(k)
+            ]
+            if masked_w:
+                console.print(f"🌐 使用代理环境(WORKER {worker_node.get('name','')}): {', '.join(masked_w)}", style="cyan")
+
+            # 可选：为 Docker 守护进程配置代理（忽略失败继续）
+            try:
+                self.remote_executor.configure_docker_daemon_proxy(host, ssh_port, username, password, env)
+            except Exception:
+                pass
+
             # 上传远程执行库
-            if not self.remote_executor.upload_remote_lib(host, ssh_port, username, password, str(self.remote_lib_path)):
+            if not self.remote_executor.upload_remote_lib(host, ssh_port, username, password, str(self.remote_lib_path), env=env):
                 return False
-            
+
             # 获取 head 节点地址
             head_host, head_ssh_port = self._parse_ssh_url(head_node.get('ssh_url'))
             head_ray_port = head_node.get('ray_config', {}).get('port', 10001)
@@ -189,12 +353,30 @@ class RayClusterManager(ClusterManager):
             worker_name = worker_node.get('name', 'worker')
             success = self.remote_executor.execute_ray_command_with_logging(
                 host, ssh_port, username, password, "start-worker", ray_args,
-                realtime_output=True, logtag=f"worker_{worker_name}"
+                realtime_output=True, logtag=f"worker_{worker_name}", env=env
             )
             
             if success:
                 console.print(f"✅ Worker 节点 {worker_node.get('name')} 启动成功", style="green")
                 self.worker_nodes.append(worker_node)
+                # Ray worker 已启动/已在运行，再确保 NodeConfigActor（后台常驻，幂等）
+                try:
+                    node_key = f"{username}@{host}:{ssh_port}"
+                    if node_key not in self._nodecfg_ensured:
+                        env_cfg = dict(env or {})
+                        # 指定 ray client 地址为 head 的 client 端口
+                        client_port = int(head_ray_port) + 1
+                        env_cfg['RAY_ADDRESS'] = f"ray://{head_host}:{client_port}"
+                        self.remote_executor.execute_ray_command_with_logging(
+                            host, ssh_port, username, password,
+                            "start-config-actor",
+                            realtime_output=True,
+                            logtag=f"config_{worker_name}",
+                            env=env_cfg,
+                        )
+                        self._nodecfg_ensured.add(node_key)
+                except Exception:
+                    pass
                 return True
             else:
                 console.print(f"❌ Worker 节点启动失败", style="red")
@@ -310,8 +492,28 @@ class RayClusterManager(ClusterManager):
             username = user.get('userid', 'root')
             password = user.get('password')
             
-            # 检查 Ray 状态
-            status = self.remote_executor.check_ray_status(host, ssh_port, username, password)
+            # 检查 Ray 状态（携带代理；优先 etcd 元数据，其次节点内联）
+            proxy_cfg = node.get('proxy', {}) or {}
+            try:
+                ssh_url = node.get('ssh_url')
+                etcd_meta = getattr(self, 'current_cluster_metadata', {}) or {}
+                meta_map = etcd_meta.get('node_proxy_env', {}) if isinstance(etcd_meta, dict) else {}
+                node_name = node.get('name')
+                if ssh_url in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(ssh_url) or {})}
+                if node_name and node_name in meta_map:
+                    proxy_cfg = {**proxy_cfg, **(meta_map.get(node_name) or {})}
+            except Exception:
+                pass
+            env = {}
+            for key in (
+                'http_proxy', 'https_proxy', 'no_proxy',
+                'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'
+            ):
+                if key in proxy_cfg and proxy_cfg.get(key):
+                    env[key] = proxy_cfg.get(key)
+
+            status = self.remote_executor.check_ray_status(host, ssh_port, username, password, env=env)
             return status
                 
         except Exception as e:

@@ -424,6 +424,11 @@ nodes:
   - ssh_url: "localhost:10001"
     name: "ray-head-node"  # Node name seen by the actual system
     role: "head"
+    # Optional: per-node proxy for network access of pip/git/docker
+    # proxy:
+    #   http_proxy: "http://127.0.0.1:7890"
+    #   https_proxy: "http://127.0.0.1:7890"
+    #   no_proxy: "localhost,127.0.0.1,10.0.0.0/8"
     storage:
       type: "local"
       path: "/opt/nokube/data/ray/head"
@@ -436,6 +441,11 @@ nodes:
   - ssh_url: "localhost:10002"
     name: "ray-worker-1"   # Node name seen by the actual system
     role: "worker"
+    # Optional: per-node proxy for network access of pip/git/docker
+    # proxy:
+    #   http_proxy: "http://127.0.0.1:7890"
+    #   https_proxy: "http://127.0.0.1:7890"
+    #   no_proxy: "localhost,127.0.0.1,10.0.0.0/8"
     storage:
       type: "local"
       path: "/opt/nokube/data/ray/worker-1"
@@ -448,6 +458,11 @@ nodes:
   - ssh_url: "localhost:10003"
     name: "ray-worker-2"   # Node name seen by the actual system
     role: "worker"
+    # Optional: per-node proxy for network access of pip/git/docker
+    # proxy:
+    #   http_proxy: "http://127.0.0.1:7890"
+    #   https_proxy: "http://127.0.0.1:7890"
+    #   no_proxy: "localhost,127.0.0.1,10.0.0.0/8"
     storage:
       type: "local"
       path: "/opt/nokube/data/ray/worker-2"

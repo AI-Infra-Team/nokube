@@ -47,3 +47,5 @@ docker push localhost:5000/busybox:latest
 - 如节点 Docker 默认不信任私有仓库，请为 Docker 配置 insecure registries 或 CA 证书。
 
 
+
+

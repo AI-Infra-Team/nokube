@@ -14,6 +14,8 @@ import subprocess
 import threading
 import sys
 import json
+import os
+from urllib.parse import urlparse
 
 import ray
 
@@ -45,6 +47,16 @@ def _compose_name(prefix: str, parts: List[str], max_len: int = 60) -> str:
     return f"{prefix}-{compact}-{suffix}"
 
 
+def _compose_container_actor_name(ns: str, pod: str, container_name: str) -> str:
+    """稳定的 ContainerActor 命名：基于 namespace/pod/container 三段。
+    采用固定命名，便于分布式幂等与去重。"""
+    return "ctr-" + "-".join([
+        _safe_name(ns),
+        _safe_name(pod),
+        _safe_name(container_name),
+    ])
+
+
 def _log(prefix: str, message: str):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {prefix} | {message}", flush=True)
@@ -58,6 +70,231 @@ def _try_create_etcd():
         return None
 
 
+def _resolve_node_proxy_env() -> Dict[str, str]:
+    """解析当前 Actor 所在节点的代理环境（来自 etcd 元数据）。
+
+    约定：在创建 Actor 前设置宿主节点标识到当前进程环境（NOKUBE_NODE_NAME 或 NOKUBE_NODE_SSH_URL），
+    则在 etcd 的 metadata.node_proxy_env 中用该键查找对应的 env；
+    否则返回空。
+    """
+    try:
+        # 源自 Pod/Deployment 控制器可选注入的宿主节点键
+        node_key = None
+        # 允许通过容器 env 显式传入
+        # 注意：此函数由 _build_env_dict 调用，此时容器 env 尚未合并，需从 self.container 读取
+        # 因为这里是模块级函数，无法访问 self.container，改为读取进程环境中的 hint
+        # 外层若有能力可预先导出到 os.environ
+        # 优先使用节点 name
+        node_key = os.environ.get("NOKUBE_NODE_NAME") or os.environ.get("NOKUBE_NODE_SSH_URL")
+        if not node_key:
+            return {}
+
+        etcd = _try_create_etcd()
+        if not etcd:
+            return {}
+        # 读取 clusters 列表，遍历 metadata.node_proxy_env
+        clusters = etcd.list_clusters() or []
+        for c in clusters:
+            meta = (c or {}).get('metadata') or {}
+            mapping = meta.get('node_proxy_env') or {}
+            if not isinstance(mapping, dict):
+                continue
+            # 直接按 ssh_url 命中
+            if node_key in mapping and isinstance(mapping[node_key], dict):
+                # 仅返回常见代理键
+                env = {}
+                for key in ("http_proxy","https_proxy","no_proxy","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"):
+                    val = mapping[node_key].get(key)
+                    if val:
+                        env[key] = str(val)
+                return env
+        return {}
+    except Exception:
+        return {}
+
+
+def _mask_proxy_items(env_map: Dict[str, str]) -> List[str]:
+    """将代理相关环境变量脱敏为可读摘要。"""
+    items: List[str] = []
+    try:
+        for key in ("http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+            val = env_map.get(key)
+            if not val:
+                continue
+            if key.lower() == "no_proxy":
+                parts = [s.strip() for s in str(val).split(',') if s.strip()]
+                preview = ','.join(parts[:5])
+                suffix = '' if len(parts) <= 5 else f" (+{len(parts)-5})"
+                items.append(f"{key}={preview}{suffix}")
+            else:
+                try:
+                    p = urlparse(str(val))
+                    if p.scheme and (p.hostname or p.netloc):
+                        host = p.hostname or ''
+                        port = f":{p.port}" if p.port else ''
+                        items.append(f"{key}={p.scheme}://{host}{port}")
+                    else:
+                        sval = str(val)
+                        items.append(f"{key}={sval[:120]}{'' if len(sval) <= 120 else '…'}")
+                except Exception:
+                    items.append(f"{key}={val}")
+    except Exception:
+        pass
+    return items
+
+
+@ray.remote
+class NodeConfigActor:
+    """每节点常驻的配置 Actor：根据 etcd 元数据为本节点下发系统配置（如 Docker 代理）。"""
+
+    def __init__(self, interval_sec: int = 60):
+        self.interval_sec = max(10, int(interval_sec))
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
+        self._etcd = _try_create_etcd()
+        # 识别本节点名称（使用主机名）
+        try:
+            import socket
+            self.node_name = socket.gethostname()
+        except Exception:
+            self.node_name = os.environ.get("NOKUBE_NODE_NAME", "")
+        self._last_applied: Dict[str, str] = {}
+
+    def _fetch_proxy_env(self) -> Dict[str, str]:
+        try:
+            if not self._etcd:
+                return {}
+            clusters = self._etcd.list_clusters() or []
+            for c in clusters:
+                meta = (c or {}).get('metadata') or {}
+                mapping = meta.get('node_proxy_env') or {}
+                if not isinstance(mapping, dict):
+                    continue
+                # 支持通过节点 name 直取
+                for key in (self.node_name, os.environ.get("NOKUBE_NODE_SSH_URL", "")):
+                    if key and key in mapping and isinstance(mapping[key], dict):
+                        env = {}
+                        for k in ("http_proxy","https_proxy","no_proxy","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"):
+                            v = mapping[key].get(k)
+                            if v:
+                                env[k] = str(v)
+                        return env
+            return {}
+        except Exception:
+            return {}
+
+    def _ensure_docker_daemon_proxy(self, env_map: Dict[str, str]) -> bool:
+        try:
+            # 仅当有变更时应用
+            if env_map == self._last_applied:
+                return True
+
+            http_p = env_map.get('http_proxy') or env_map.get('HTTP_PROXY')
+            https_p = env_map.get('https_proxy') or env_map.get('HTTPS_PROXY')
+            no_p = env_map.get('no_proxy') or env_map.get('NO_PROXY')
+            if not any([http_p, https_p, no_p]):
+                return True
+
+            # 读取现有 /etc/docker/daemon.json
+            import json as _json
+            daemon_dir = "/etc/docker"
+            daemon_file = f"{daemon_dir}/daemon.json"
+
+            def _run(cmd: str) -> bool:
+                try:
+                    # 非 root 使用 sudo -E -n
+                    prefix = [] if os.geteuid() == 0 else ["sudo","-E","-n"]
+                    res = subprocess.run(prefix + ["bash","-lc", cmd], capture_output=True, text=True)
+                    if res.returncode != 0:
+                        _log("CFG", f"cmd fail code={res.returncode} err={(res.stderr or '').strip()[:200]}")
+                        return False
+                    return True
+                except Exception as e:
+                    _log("CFG", f"cmd exception: {e}")
+                    return False
+
+            # 读文件
+            read = subprocess.run(["bash","-lc", f"cat {daemon_file}"], capture_output=True, text=True)
+            try:
+                current = _json.loads(read.stdout) if read.returncode == 0 and read.stdout.strip() else {}
+            except Exception:
+                current = {}
+
+            if 'proxies' not in current or not isinstance(current['proxies'], dict):
+                current['proxies'] = {}
+            proxies = current['proxies']
+            if http_p:
+                proxies['http-proxy'] = http_p
+            else:
+                proxies.pop('http-proxy', None)
+            if https_p:
+                proxies['https-proxy'] = https_p
+            else:
+                proxies.pop('https-proxy', None)
+            if no_p:
+                proxies['no-proxy'] = no_p
+            else:
+                proxies.pop('no-proxy', None)
+
+            tmp_json = "/tmp/daemon.json"
+            data = _json.dumps(current, indent=2)
+            with open(tmp_json, 'w') as f:
+                f.write(data)
+
+            # 安装并重启 docker
+            steps = [
+                f"mkdir -p {daemon_dir}",
+                f"install -o root -g root -m 644 {tmp_json} {daemon_file}",
+                "systemctl restart docker || service docker restart || true",
+            ]
+            ok_all = True
+            for s in steps:
+                if not _run(s):
+                    ok_all = False
+            if ok_all:
+                self._last_applied = dict(env_map)
+                masked = ', '.join(_mask_proxy_items(env_map))
+                _log("CFG", f"docker daemon proxy updated: {masked}")
+                return True
+            return False
+        except Exception as e:
+            _log("CFG", f"apply daemon proxy failed: {e}")
+            return False
+
+    def _loop(self):
+        backoff = self.interval_sec
+        while not self._stop:
+            try:
+                env_map = self._fetch_proxy_env()
+                if env_map:
+                    self._ensure_docker_daemon_proxy(env_map)
+            except Exception:
+                pass
+            for _ in range(self.interval_sec):
+                if self._stop:
+                    break
+                time.sleep(1)
+
+    def start(self) -> str:
+        try:
+            if not self._thread:
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
+            _log("CFG", f"NodeConfigActor started on node={self.node_name}")
+            return "Running"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def stop(self) -> str:
+        try:
+            self._stop = True
+            if self._thread:
+                self._thread.join(timeout=3)
+        except Exception:
+            pass
+        return "Stopped"
+
+
 @ray.remote
 class ContainerActor:
     """容器级 Actor：最小实现，使用 docker SDK 运行容器。"""
@@ -69,8 +306,24 @@ class ContainerActor:
         self.actor_name = actor_name
         self.status = "Pending"
         self.container_id: Optional[str] = None
+        self.container_name: str = _safe_name(actor_name)
+        self._proc: Optional[subprocess.Popen] = None
+        self._io_thread: Optional[threading.Thread] = None
+        self._stop_stream: bool = False
 
-    def start(self, attempts: int = 5, backoff_seconds: float = 3.0) -> Dict[str, Any]:
+    def start(self, attempts: int = 5, backoff_seconds: float = 3.0, stream_logs: bool = True) -> Dict[str, Any]:
+        # 开头打印当前进程可见的代理环境摘要
+        try:
+            proxy_items = _mask_proxy_items(os.environ)
+            if proxy_items:
+                _log(f"CTR {self.actor_name}", f"proxy env: {', '.join(proxy_items)}")
+        except Exception:
+            pass
+        def _sudo_prefix() -> List[str]:
+            try:
+                return [] if os.geteuid() == 0 else ["sudo", "-E", "-n"]
+            except Exception:
+                return ["sudo", "-E", "-n"]
         def _build_env_dict() -> Dict[str, str]:
             env_dict: Dict[str, str] = {}
             for env in self.container.get("env", []) or []:
@@ -78,6 +331,13 @@ class ContainerActor:
                 value = env.get("value")
                 if name is not None and value is not None:
                     env_dict[name] = value
+            # 合并来自集群元数据的节点代理环境
+            try:
+                proxy_env = _resolve_node_proxy_env()
+                if proxy_env:
+                    env_dict.update(proxy_env)
+            except Exception:
+                pass
             return env_dict
 
         def _build_ports_list() -> List[str]:
@@ -109,18 +369,73 @@ class ContainerActor:
             port_args = _build_ports_list()
             final_cmd = _build_final_cmd()
 
-            run_args: List[str] = ["sudo", "-n", "docker", "run", "-d"]
+            run_args: List[str] = _sudo_prefix() + ["docker", "run", "--rm", "--name", self.container_name]
             for k, v in env_dict.items():
                 run_args.extend(["-e", f"{k}={v}"])
             run_args.extend(port_args)
             run_args.append(image)
             run_args.extend(final_cmd)
 
-            proc = subprocess.run(run_args, capture_output=True, text=True)
-            if proc.returncode == 0:
-                self.container_id = proc.stdout.strip()
-                self.status = "Running"
-                return {
+            # 为 docker CLI 进程注入代理等环境变量（仅提取常见代理键）
+            proc_env = dict(**os.environ)
+            for key in ("http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+                if key in env_dict and env_dict.get(key) is not None:
+                    proc_env[key] = str(env_dict.get(key))
+
+            # 确保 no_proxy 至少包含本地常见地址，避免代理环路
+            try:
+                default_no_proxy = "localhost,127.0.0.1,::1"
+                existing = proc_env.get('no_proxy') or proc_env.get('NO_PROXY') or ''
+                if default_no_proxy not in existing:
+                    merged = ','.join([p for p in [existing, default_no_proxy] if p])
+                    # 保持大小写一致：优先 lower key
+                    if 'no_proxy' in proc_env:
+                        proc_env['no_proxy'] = merged
+                    else:
+                        proc_env['NO_PROXY'] = merged
+            except Exception:
+                pass
+            # 执行并打印状态
+            start_ts = time.time()
+            try:
+                # 前台运行并实时读取输出
+                self._proc = subprocess.Popen(
+                    run_args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=proc_env,
+                    bufsize=1,
+                )
+            except Exception as e:
+                raise RuntimeError(str(e))
+
+            # 启动 IO 线程，将容器输出透传到日志
+            def _pump():
+                try:
+                    if self._proc and self._proc.stdout is not None:
+                        for line in self._proc.stdout:
+                            if self._stop_stream:
+                                break
+                            try:
+                                _log(f"CTR {self.actor_name}", f"{line.rstrip()}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            self._stop_stream = False
+            self._io_thread = threading.Thread(target=_pump, daemon=True)
+            self._io_thread.start()
+
+            # 简短等待，判断是否立即失败
+            time.sleep(0.3)
+            if self._proc.poll() is not None and self._proc.returncode is not None and self._proc.returncode != 0:
+                dur_ms = int((time.time() - start_ts) * 1000)
+                _log(f"CTR {self.actor_name}", f"docker run exited early code={self._proc.returncode} in {dur_ms}ms")
+                raise RuntimeError(f"docker run exited: code={self._proc.returncode}")
+
+            self.status = "Running"
+            return {
                     "pod": self.pod_name,
                     "namespace": self.namespace,
                     "container": self.container.get("name"),
@@ -128,43 +443,8 @@ class ContainerActor:
                     "status": self.status,
                     "image": image,
                     "container_id": self.container_id,
+                    "container_name": self.container_name,
                 }
-            else:
-                # 回退到 docker SDK（若 CLI 不可用）
-                try:
-                    import docker
-                    client = docker.from_env()
-                    run_cfg = {
-                        "image": image,
-                        "detach": True,
-                        "environment": env_dict or None,
-                        "ports": None,
-                    }
-                    # 将端口转为 SDK 形式，如 {"80/tcp": None}
-                    ports_dict: Dict[str, Optional[int]] = {}
-                    for p in self.container.get("ports", []) or []:
-                        cport = p.get("containerPort")
-                        proto = (p.get("protocol") or "TCP").lower()
-                        if cport:
-                            ports_dict[f"{cport}/{proto}"] = None
-                    run_cfg["ports"] = ports_dict or None
-                    if final_cmd:
-                        run_cfg["command"] = final_cmd
-                    c = client.containers.run(**run_cfg)
-                    self.container_id = c.id
-                    self.status = "Running"
-                    return {
-                        "pod": self.pod_name,
-                        "namespace": self.namespace,
-                        "container": self.container.get("name"),
-                        "actor": self.actor_name,
-                        "status": self.status,
-                        "image": image,
-                        "container_id": self.container_id,
-                    }
-                except Exception as e2:
-                    err = proc.stderr.strip() or str(e2)
-                    raise RuntimeError(err)
 
         # 带重试与退避，避免权限/短暂不可用导致父 Pod 失败
         try_count = 0
@@ -206,19 +486,34 @@ class ContainerActor:
 
     def stop(self) -> str:
         try:
-            if self.container_id:
-                # 尝试 sudo docker rm -f
-                proc = subprocess.run(["sudo", "-n", "docker", "rm", "-f", self.container_id], capture_output=True, text=True)
-                if proc.returncode != 0:
-                    # 回退到 SDK
-                    try:
-                        import docker
-                        client = docker.from_env()
-                        c = client.containers.get(self.container_id)
-                        c.stop()
-                        c.remove()
-                    except Exception:
-                        pass
+            # 停止输出线程
+            try:
+                self._stop_stream = True
+                if self._io_thread:
+                    self._io_thread.join(timeout=2)
+            except Exception:
+                pass
+            # 结束前台 docker 进程（如仍在）
+            try:
+                if self._proc and self._proc.poll() is None:
+                    self._proc.terminate()
+            except Exception:
+                pass
+            # 尝试用容器名强制删除（即使 --rm，失败也忽略）
+            try:
+                sudo_prefix = [] if os.geteuid() == 0 else ["sudo", "-E", "-n"]
+            except Exception:
+                sudo_prefix = ["sudo", "-E", "-n"]
+            try:
+                _log(f"CTR {self.actor_name}", f"docker rm -f {self.container_name}")
+                proc = subprocess.run(sudo_prefix + ["docker", "rm", "-f", self.container_name], capture_output=True, text=True)
+                try:
+                    stderr_tail = (proc.stderr or '').strip()[:300]
+                    _log(f"CTR {self.actor_name}", f"docker rm exit={proc.returncode} err={stderr_tail}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except BaseException:
             pass
         self.status = "Stopped"
@@ -226,6 +521,27 @@ class ContainerActor:
 
     def get_status(self) -> str:
         return self.status
+
+    def alive(self) -> bool:
+        """检查底层 docker 容器是否仍在运行。"""
+        try:
+            # 通过容器名探测
+            try:
+                sudo_prefix = [] if os.geteuid() == 0 else ["sudo", "-E", "-n"]
+            except Exception:
+                sudo_prefix = ["sudo", "-E", "-n"]
+            proc = subprocess.run(
+                sudo_prefix + [
+                    "docker", "inspect", "-f", "{{.State.Running}}", self.container_name
+                ],
+                capture_output=True,
+                text=True,
+            )
+            out = (proc.stdout or "").strip().lower()
+            return proc.returncode == 0 and out == "true"
+        except BaseException:
+            return False
+
 
 
 @ray.remote
@@ -246,6 +562,8 @@ class PodActor:
         self.actor_name = actor_name
         self.status = "Pending"
         self.container_actors: List[Any] = []
+        # 维护按容器名索引的单实例映射，避免重复创建
+        self._actor_by_container: Dict[str, Any] = {}
         self._stop_flag = False
         self._threads: List[threading.Thread] = []
         self._status_thread: Optional[threading.Thread] = None
@@ -257,28 +575,73 @@ class PodActor:
     def _supervise_container(self, container_spec: Dict[str, Any]):
         c_name = _safe_name(container_spec.get("name", "container"))
         backoff = 5.0
+        from src.actor_utils import ensure_actor  # type: ignore
+        ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
         while not self._stop_flag:
-            # 每次尝试使用新的 actor 名，避免命名冲突
-            c_actor_name = _compose_name("ctr", [self.namespace, self.pod_name, c_name, _short_id()])
+            # 每轮从最新 desired 列表提取此容器的当前期望 spec
             try:
+                latest_spec = next((c for c in (self.containers or []) if _safe_name(c.get("name")) == c_name), None)
+            except Exception:
+                latest_spec = None
+            if latest_spec is None:
+                # 期望不存在该容器，等待并继续
+                for _ in range(5):
+                    if self._stop_flag:
+                        break
+                    time.sleep(1)
+                continue
+            # 如果已有同名容器 actor，优先进行存活检查，避免重复创建
+            existing = self._actor_by_container.get(c_name)
+            if existing is not None:
                 try:
-                    actor = ContainerActor.options(name=c_actor_name).remote(
-                        self.pod_name, self.namespace, container_spec, c_actor_name
-                    )
+                    alive = bool(ray.get(existing.alive.remote(), timeout=3))
                 except Exception:
-                    actor = ContainerActor.options(name=None).remote(
-                        self.pod_name, self.namespace, container_spec, c_actor_name
-                    )
-                # 单次尝试，失败则由本监督循环重试
+                    alive = False
+                if alive:
+                    # 已在运行：延迟一段时间后复检
+                    sleep_secs = 15.0
+                    for _ in range(int(sleep_secs)):
+                        if self._stop_flag:
+                            break
+                        time.sleep(1)
+                    continue
+                else:
+                    # 旧实例已不在，尝试清理
+                    try:
+                        existing.stop.remote()
+                    except Exception:
+                        pass
+                    try:
+                        # 从记录中移除
+                        self._actor_by_container.pop(c_name, None)
+                        # 同步列表
+                        self.container_actors = [a for a in self.container_actors if a is not existing]
+                    except Exception:
+                        pass
+
+            # 创建/替换稳定命名的容器 actor，并尝试启动一次
+            c_actor_name = _compose_container_actor_name(self.namespace, self.pod_name, c_name)
+            try:
+                actor = ensure_actor(
+                    ContainerActor,
+                    c_actor_name,
+                    namespace=ns,
+                    detached=False,
+                    replace_existing=True,
+                    ctor_args=(self.pod_name, self.namespace, latest_spec, c_actor_name),
+                    stop_method="stop",
+                    stop_timeout=10,
+                )
                 result = ray.get(actor.start.remote(attempts=1, backoff_seconds=1.0))
                 self._container_status[c_name] = result
                 if result.get("status") == "Running":
-                    # 成功后维持一段时间再复检（轻量心跳）
-                    self.container_actors.append(actor)
+                    # 记录为该容器的唯一实例
+                    self._actor_by_container[c_name] = actor
+                    if actor not in self.container_actors:
+                        self.container_actors.append(actor)
                     backoff = 10.0
                     sleep_secs = 15.0
                 else:
-                    # 失败则指数退避，保持 Pod 存活
                     backoff = min(backoff * 2, 60.0)
                     sleep_secs = backoff
             except Exception as e:
@@ -293,13 +656,20 @@ class PodActor:
                 backoff = min(backoff * 2, 60.0)
                 sleep_secs = backoff
 
-            # 睡眠后继续尝试，不退出
+            # 睡眠后继续下一轮
             for _ in range(int(sleep_secs)):
                 if self._stop_flag:
                     break
                 time.sleep(1)
 
     def start(self) -> Dict[str, Any]:
+        # 开头打印当前进程可见的代理环境摘要
+        try:
+            proxy_items = _mask_proxy_items(os.environ)
+            if proxy_items:
+                _log(f"POD {self.actor_name}", f"proxy env: {', '.join(proxy_items)}")
+        except Exception:
+            pass
         # 为每个容器启动监督线程：失败不退出，sleep 一会再重启
         self.status = "Running"
         for c in self.containers:
@@ -327,11 +697,15 @@ class PodActor:
             except Exception:
                 pass
         # 先停止容器级 Actor
-        if self.container_actors:
-            try:
-                ray.get([a.stop.remote() for a in self.container_actors])
-            except Exception:
-                pass
+        try:
+            actors = list(self._actor_by_container.values()) if self._actor_by_container else self.container_actors
+            if actors:
+                try:
+                    ray.get([a.stop.remote() for a in actors])
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.status = "Stopped"
         return self.status
 
@@ -409,30 +783,39 @@ class PodActor:
         desired_by_name = {c.get("name"): c for c in desired if c.get("name")}
 
         # 停掉删除/变更的容器 actor
-        to_stop: List[Any] = []
+        to_stop_names: List[str] = []
         for name, cstat in current_by_name.items():
             if name not in desired_by_name:
-                # 删除
-                actor = next((a for a in self.container_actors if isinstance(a, ray.actor.ActorHandle)), None)
-                if actor:
-                    to_stop.append(actor)
+                to_stop_names.append(name)
             else:
-                # 比较关键字段
                 d = desired_by_name[name]
                 if any([
                     cstat.get("image") != d.get("image"),
+                    (cstat.get("status") != "Running"),
                 ]):
-                    actor = next((a for a in self.container_actors if isinstance(a, ray.actor.ActorHandle)), None)
-                    if actor:
-                        to_stop.append(actor)
-        if to_stop:
+                    to_stop_names.append(name)
+
+        if to_stop_names:
+            # 精确按容器名停止旧实例
+            actors_to_stop: List[Any] = []
+            for n in to_stop_names:
+                actor = self._actor_by_container.get(n)
+                if actor is not None:
+                    actors_to_stop.append(actor)
+            if actors_to_stop:
+                try:
+                    ray.get([a.stop.remote() for a in actors_to_stop], timeout=5)
+                except Exception:
+                    pass
+            # 从记录中移除这些容器
+            for n in to_stop_names:
+                self._actor_by_container.pop(n, None)
+                self._container_status.pop(n, None)
+            # 同步列表视图
             try:
-                ray.get([a.stop.remote() for a in to_stop], timeout=5)
+                self.container_actors = list(self._actor_by_container.values())
             except Exception:
                 pass
-            # 清空本地记录，待监督线程按新 spec 重建
-            self.container_actors = []
-            self._container_status = {}
         # 更新期望容器列表
         self.containers = desired
 
@@ -456,14 +839,40 @@ class DeploymentActor:
         self.spec_key = f"/nokube/deployments/{self.namespace}/{self.name}/spec"
 
     def start(self) -> Dict[str, Any]:
+        # 开头打印当前进程可见的代理环境摘要
+        try:
+            proxy_items = _mask_proxy_items(os.environ)
+            if proxy_items:
+                _log(f"DEP {self.name}", f"proxy env: {', '.join(proxy_items)}")
+        except Exception:
+            pass
         # 发布初始 desired spec 到存储
+        # 在启动 Pod/Container 子 Actor 前，将当前节点 name 注入进程环境，供子 Actor 解析代理环境
+        try:
+            # 如果外层控制器已知宿主节点名，可通过环境变量 NOKUBE_NODE_NAME 传递
+            # 此处保持已有值，不覆盖
+            if not os.environ.get("NOKUBE_NODE_NAME"):
+                # 尝试从 etcd 的节点信息中推断（若可用）；此处简单保留已有约定，外层负责设置
+                pass
+        except Exception:
+            pass
         self._publish_spec()
         futures = []
+        from src.actor_utils import ensure_actor  # type: ignore
+        ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
         for i in range(self.replicas):
             pod_name = f"{self.name}-pod-{i}"
-            pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{i}-{_short_id()}"
-            pod = PodActor.options(name=pod_actor_name).remote(
-                pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key
+            pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{i}"
+            # 幂等：pod actor 使用稳定名字，替换旧实例
+            pod = ensure_actor(
+                PodActor,
+                pod_actor_name,
+                namespace=ns,
+                detached=False,
+                replace_existing=True,
+                ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key),
+                stop_method="stop",
+                stop_timeout=10,
             )
             self.pods[pod_name] = pod
             futures.append(pod.start.remote())
@@ -539,9 +948,16 @@ class DeploymentActor:
                     if pod_name in self.pods:
                         idx += 1
                         continue
-                    pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{idx}-{_short_id()}"
-                    pod = PodActor.options(name=pod_actor_name).remote(
-                        pod_name, self.namespace, self.containers, pod_actor_name
+                    pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{idx}"
+                    pod = ensure_actor(
+                        PodActor,
+                        pod_actor_name,
+                        namespace=ns,
+                        detached=False,
+                        replace_existing=True,
+                        ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key),
+                        stop_method="stop",
+                        stop_timeout=10,
                     )
                     self.pods[pod_name] = pod
                     try:
@@ -628,11 +1044,20 @@ class DeploymentActor:
             self.pods.clear()
 
         # 重建期望数量的 pods
+        from src.actor_utils import ensure_actor  # type: ignore
+        ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
         for i in range(self.replicas):
             pod_name = f"{self.name}-pod-{i}"
-            pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{i}-{_short_id()}"
-            pod = PodActor.options(name=pod_actor_name).remote(
-                pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key
+            pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{i}"
+            pod = ensure_actor(
+                PodActor,
+                pod_actor_name,
+                namespace=ns,
+                detached=False,
+                replace_existing=True,
+                ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key),
+                stop_method="stop",
+                stop_timeout=10,
             )
             self.pods[pod_name] = pod
             try:
@@ -659,10 +1084,16 @@ class KubeControllerActor:
     def __init__(self, name: str = "nokube-kube-controller"):
         self.name = name
         self.pods: Dict[str, Any] = {}
-        self.store_enabled = EtcdManager is not None
+        # 延迟导入判定 etcd 可用性
+        try:
+            from src.etcd_manager import EtcdManager as _EM  # type: ignore
+            self.store_enabled = _EM is not None
+        except Exception:
+            self.store_enabled = False
         if self.store_enabled:
             try:
-                self.etcd = EtcdManager()
+                from src.etcd_manager import EtcdManager as _EM2  # type: ignore
+                self.etcd = _EM2()
             except Exception:
                 self.etcd = None
                 self.store_enabled = False

@@ -108,6 +108,32 @@ class GitWatcher:
             console.print(f"❌ 获取仓库哈希失败 {repo_name}: {e}", style="red")
         
         return ""
+
+    def _get_repo_head(self, repo_name: str) -> str:
+        """获取仓库当前 HEAD 提交哈希（失败返回空字符串）"""
+        try:
+            repo_config = self._get_repo_config(repo_name)
+            repo_dir = f"./repos/{repo_name}"
+            if not os.path.exists(repo_dir):
+                try:
+                    self._clone_repo(repo_config)
+                except Exception as e:
+                    console.print(f"⚠️ 仓库克隆失败(跳过本轮): {repo_name} -> {e}", style="yellow")
+                    return ""
+            else:
+                try:
+                    self._pull_repo(repo_config)
+                except Exception as e:
+                    console.print(f"⚠️ 仓库更新失败(继续轮询): {repo_name} -> {e}", style="yellow")
+            # 读取 HEAD 提交
+            result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True)
+            if result.returncode == 0:
+                return (result.stdout or "").strip()
+            console.print(f"⚠️ 获取 HEAD 失败: {repo_name} -> {result.stderr}", style="yellow")
+            return ""
+        except Exception as e:
+            console.print(f"⚠️ 获取仓库 HEAD 失败: {repo_name} -> {e}", style="yellow")
+            return ""
     
     def _get_repo_config(self, repo_name: str) -> Dict:
         """获取仓库配置"""
@@ -212,35 +238,31 @@ class GitWatcher:
             raise Exception(f"更新仓库失败: {result.stderr}")
     
     def _check_repo_changes(self, repo_name: str) -> bool:
-        """检查仓库是否有变更"""
-        repo_config = self._get_repo_config(repo_name)
-        # 兼容旧字段 config_path；推荐使用 path（目录）
-        config_path = (
-            repo_config.get('path')
-            or repo_config.get('config_path')
-        )
-        if not config_path:
-            raise ValueError(f"仓库 {repo_name} 缺少 path/config_path 配置")
-        
-        # 获取当前哈希
-        current_hash = self._get_repo_hash(repo_name, config_path)
-        
-        # 获取上次哈希
-        last_hash = self.state.get(repo_name, {}).get('last_hash', '')
-        
-        if current_hash != last_hash:
-            console.print(f"🔄 检测到变更: {repo_name}", style="yellow")
-            
-            # 更新状态
+        """检查仓库是否有变更：基于 HEAD 提交哈希判断"""
+        head = self._get_repo_head(repo_name)
+        # 失败或未能获取 commit，保持静默继续轮询
+        if not head:
+            # 仅更新时间戳，保留原状态
             if repo_name not in self.state:
                 self.state[repo_name] = {}
-            
-            self.state[repo_name]['last_hash'] = current_hash
             self.state[repo_name]['last_check'] = datetime.now().isoformat()
             self._save_state()
-            
+            return False
+
+        last_commit = self.state.get(repo_name, {}).get('last_commit', '')
+        if head != last_commit:
+            console.print(f"🔄 检测到提交变更: {repo_name} {last_commit[:7]} -> {head[:7]}", style="yellow")
+            if repo_name not in self.state:
+                self.state[repo_name] = {}
+            self.state[repo_name]['last_commit'] = head
+            self.state[repo_name]['last_check'] = datetime.now().isoformat()
+            self._save_state()
             return True
-        
+        # 无变更
+        if repo_name not in self.state:
+            self.state[repo_name] = {}
+        self.state[repo_name]['last_check'] = datetime.now().isoformat()
+        self._save_state()
         return False
 
     def _list_yaml_files(self, repo_name: str, path_value: str) -> list:

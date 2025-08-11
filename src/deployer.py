@@ -102,28 +102,17 @@ class Deployer:
                 # 幂等：同名 DeploymentActor 复用并更新规格；不存在则创建
                 safe = lambda s: re.sub(r"[^a-zA-Z0-9_-]", "-", s or "")
                 dep_actor_name = f"deploy-{safe(ns)}-{safe(name)}"
-                try:
-                    from ray import get_actor
-                    actor = get_actor(dep_actor_name, namespace="nokube")
-                    # 为保证正确性：先关闭旧的 deployment 再重建
-                    try:
-                        ray.get(actor.stop.remote(), timeout=10)
-                    except Exception:
-                        pass
-                    try:
-                        ray.kill(actor, no_restart=True)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                # 重建新的 detached DeploymentActor（同名覆盖）
-                actor = DeploymentActor.options(
-                    name=dep_actor_name,
-                    lifetime="detached",
+                # 使用通用 ensure_actor：先停旧再替换，分布式幂等
+                from src.actor_utils import ensure_actor  # type: ignore
+                actor = ensure_actor(
+                    DeploymentActor,
+                    dep_actor_name,
                     namespace="nokube",
-                ).remote(
-                    name, ns, replicas, containers
+                    detached=True,
+                    replace_existing=True,
+                    ctor_args=(name, ns, replicas, containers),
+                    stop_method="stop",
+                    stop_timeout=10,
                 )
                 futures.append(actor.start.remote())
                 try:

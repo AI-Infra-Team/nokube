@@ -295,7 +295,14 @@ class SSHManager:
         except Exception as e:
             return False, f"检查权限时发生错误: {e}"
     
-    def execute_command(self, command: str, realtime_output: bool = True, get_pty: bool = True) -> Tuple[bool, str, str]:
+    def execute_command(
+        self,
+        command: str,
+        realtime_output: bool = True,
+        get_pty: bool = True,
+        extra_env: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> Tuple[bool, str, str]:
         """执行远程命令"""
         try:
             if not self.client:
@@ -315,16 +322,27 @@ class SSHManager:
                 if original_command != command:
                     console.print(f"🔍 原始命令: {original_command}", style="yellow")
             
-            # 使用 nohup 包裹长驻进程，确保在 SSH 断开后不退出（仅在明显长驻命令时处理）
-            long_running_prefixes = [
-                "python3 /tmp/remote_lib/ray_remote.py start-head",
-                "python3 /tmp/remote_lib/ray_remote.py start-worker",
-                "ray start --head",
-                "ray start --address=",
-            ]
+            # 不使用 nohup 后台，所有命令前台执行，便于统一调度与日志收集
+            # 注入环境变量（用于网络访问的代理等）。
+            # 对于 sudo 命令不强行注入（sudo 默认清理环境），代理主要用于非提权命令如 pip/git/ray。
+            env_prefix = ""
+            if extra_env:
+                # 同时支持小写/大写代理名由调用方传入
+                kv_pairs = []
+                for k, v in extra_env.items():
+                    if v is None:
+                        continue
+                    try:
+                        kv_pairs.append(f"{k}={shlex.quote(str(v))}")
+                    except Exception:
+                        kv_pairs.append(f"{k}={str(v)}")
+                if kv_pairs:
+                    env_prefix = "env " + " ".join(kv_pairs) + " "
+
             wrapped_command = command
-            if any(command.startswith(pfx) for pfx in long_running_prefixes):
-                wrapped_command = f"nohup sh -c {shlex.quote(command)} >/dev/null 2>&1 & echo $!"
+            # 统一前缀 env
+            if env_prefix and not command.startswith("sudo "):
+                wrapped_command = env_prefix + command
             stdin, stdout, stderr = self.client.exec_command(wrapped_command, get_pty=get_pty)
             
             stdout_str = ""
@@ -360,8 +378,23 @@ class SSHManager:
                 stdout_thread.start()
                 stderr_thread.start()
                 
-                # 等待命令完成
-                exit_status = stdout.channel.recv_exit_status()
+                # 等待命令完成（带超时）
+                chan = stdout.channel
+                exit_status = None
+                if timeout_seconds is None or timeout_seconds <= 0:
+                    exit_status = chan.recv_exit_status()
+                else:
+                    import time as _time
+                    deadline = _time.time() + timeout_seconds
+                    while not chan.exit_status_ready():
+                        if _time.time() >= deadline:
+                            try:
+                                chan.close()
+                            except Exception:
+                                pass
+                            return False, stdout_str, (stderr_str + "\ncommand timeout")
+                        _time.sleep(0.1)
+                    exit_status = chan.recv_exit_status()
                 
                 # 等待线程完成
                 stdout_thread.join()
@@ -378,8 +411,22 @@ class SSHManager:
                 stdout_str = stdout.read().decode('utf-8')
                 stderr_str = stderr.read().decode('utf-8')
                 
-                # 等待命令完成
-                exit_status = stdout.channel.recv_exit_status()
+                # 等待命令完成（带超时）
+                chan = stdout.channel
+                if timeout_seconds is None or timeout_seconds <= 0:
+                    exit_status = chan.recv_exit_status()
+                else:
+                    import time as _time
+                    deadline = _time.time() + timeout_seconds
+                    while not chan.exit_status_ready():
+                        if _time.time() >= deadline:
+                            try:
+                                chan.close()
+                            except Exception:
+                                pass
+                            return False, stdout_str, (stderr_str + "\ncommand timeout")
+                        _time.sleep(0.1)
+                    exit_status = chan.recv_exit_status()
             
             success = exit_status == 0
             
@@ -547,7 +594,7 @@ class RemoteExecutor:
     
     def execute_ray_command(self, host: str, port: int, username: str, password: str, 
                            command: str, ray_args: list = None, realtime_output: bool = True, 
-                           enable_logging: bool = False, logtag: str = None) -> bool:
+                           enable_logging: bool = False, logtag: str = None, env: Optional[Dict[str, str]] = None) -> bool:
         """Execute Ray command with optional auto-generated logging"""
         try:
             # Establish connection
@@ -588,10 +635,37 @@ class RemoteExecutor:
                 console.print(f"🚀 Executing Ray command: {full_command}", style="blue")
                 if enable_logging and log_file:
                     console.print(f"📝 Auto-generated log file: {log_file}", style="yellow")
+                # 打印代理（脱敏）
+                if env:
+                    masked = []
+                    from urllib.parse import urlparse
+                    for key in ("http_proxy","https_proxy","no_proxy","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"):
+                        val = env.get(key)
+                        if not val:
+                            continue
+                        try:
+                            if key.lower() == 'no_proxy':
+                                items = [s.strip() for s in str(val).split(',') if s.strip()]
+                                preview = ','.join(items[:5])
+                                suffix = '' if len(items) <= 5 else f" (+{len(items)-5})"
+                                masked.append(f"{key}={preview}{suffix}")
+                            else:
+                                p = urlparse(str(val))
+                                if p.scheme and (p.hostname or p.netloc):
+                                    host = p.hostname or ''
+                                    port = f":{p.port}" if p.port else ''
+                                    masked.append(f"{key}={p.scheme}://{host}{port}")
+                                else:
+                                    sval = str(val)
+                                    masked.append(f"{key}={sval[:120]}{'' if len(sval)<=120 else '…'}")
+                        except Exception:
+                            masked.append(f"{key}={val}")
+                    if masked:
+                        console.print(f"🌐 代理环境: {', '.join(masked)}", style="cyan")
             
             # Execute command
             # 不分配 pty，避免远程程序收到 SIGHUP/终端关闭导致退出
-            success, stdout, stderr = self.ssh_manager.execute_command(full_command, realtime_output=realtime_output, get_pty=False)
+            success, stdout, stderr = self.ssh_manager.execute_command(full_command, realtime_output=realtime_output, get_pty=False, extra_env=env)
             
             if success:
                 if not realtime_output:
@@ -625,7 +699,7 @@ class RemoteExecutor:
     
     def execute_ray_command_with_logging(self, host: str, port: int, username: str, password: str, 
                                         command: str, ray_args: list = None, realtime_output: bool = True, 
-                                        logtag: str = None) -> bool:
+                                        logtag: str = None, env: Optional[Dict[str, str]] = None) -> bool:
         """Execute Ray command with enhanced logging support - auto-generates log file"""
         try:
             # Establish connection
@@ -663,10 +737,37 @@ class RemoteExecutor:
             if realtime_output:
                 console.print(f"🚀 Executing Ray command with logging: {command}", style="blue")
                 console.print(f"📝 Auto-generated log file: {log_file}", style="yellow")
+                # 打印代理（脱敏）
+                if env:
+                    masked = []
+                    from urllib.parse import urlparse
+                    for key in ("http_proxy","https_proxy","no_proxy","HTTP_PROXY","HTTPS_PROXY","NO_PROXY"):
+                        val = env.get(key)
+                        if not val:
+                            continue
+                        try:
+                            if key.lower() == 'no_proxy':
+                                items = [s.strip() for s in str(val).split(',') if s.strip()]
+                                preview = ','.join(items[:5])
+                                suffix = '' if len(items) <= 5 else f" (+{len(items)-5})"
+                                masked.append(f"{key}={preview}{suffix}")
+                            else:
+                                p = urlparse(str(val))
+                                if p.scheme and (p.hostname or p.netloc):
+                                    host = p.hostname or ''
+                                    port = f":{p.port}" if p.port else ''
+                                    masked.append(f"{key}={p.scheme}://{host}{port}")
+                                else:
+                                    sval = str(val)
+                                    masked.append(f"{key}={sval[:120]}{'' if len(sval)<=120 else '…'}")
+                        except Exception:
+                            masked.append(f"{key}={val}")
+                    if masked:
+                        console.print(f"🌐 代理环境: {', '.join(masked)}", style="cyan")
             
             # Execute command
             # 不分配 pty，避免远程程序收到 SIGHUP/终端关闭导致退出
-            success, stdout, stderr = self.ssh_manager.execute_command(full_command, realtime_output=realtime_output, get_pty=False)
+            success, stdout, stderr = self.ssh_manager.execute_command(full_command, realtime_output=realtime_output, get_pty=False, extra_env=env)
             
             if success:
                 if not realtime_output:
@@ -698,7 +799,7 @@ class RemoteExecutor:
             self.ssh_manager.disconnect()
 
     def get_remote_log(self, host: str, port: int, username: str, password: str, 
-                      remote_log_file: str, local_log_file: str = None) -> bool:
+                      remote_log_file: str, local_log_file: str = None, env: Optional[Dict[str, str]] = None) -> bool:
         """Download remote log file to local system"""
         try:
             # Establish connection
@@ -715,6 +816,7 @@ class RemoteExecutor:
                 os.makedirs(local_log_dir, exist_ok=True)
             
             # Download log file
+            # 下载日志不需要代理注入
             success = self.ssh_manager.download_file(remote_log_file, local_log_file)
             
             if success:
@@ -730,8 +832,89 @@ class RemoteExecutor:
         finally:
             self.ssh_manager.disconnect()
     
+    def configure_docker_daemon_proxy(self, host: str, port: int, username: str, password: str,
+                                      proxy_env: Optional[Dict[str, str]] = None) -> bool:
+        """在远程节点通过 /etc/docker/daemon.json 配置 Docker 守护进程代理并重启。
+
+        仅当传入 proxy_env 含 http_proxy/https_proxy/no_proxy 之一时生效。
+        """
+        try:
+            if not proxy_env:
+                return True
+            # 规范化键
+            def norm(key: str) -> Optional[str]:
+                if not proxy_env:
+                    return None
+                return str(proxy_env.get(key) or proxy_env.get(key.upper()) or proxy_env.get(key.lower()) or "") or None
+
+            http_p = norm('http_proxy')
+            https_p = norm('https_proxy')
+            no_p = norm('no_proxy')
+            if not any([http_p, https_p, no_p]):
+                return True
+
+            if not self.ssh_manager.connect(host, port, username, password):
+                return False
+
+            # 读取现有 daemon.json
+            import json as _json
+            daemon_dir = "/etc/docker"
+            daemon_file = f"{daemon_dir}/daemon.json"
+            ok, out, err = self.ssh_manager.execute_command(f"cat {daemon_file}", realtime_output=False)
+            try:
+                current = _json.loads(out) if ok and out.strip() else {}
+            except Exception:
+                current = {}
+
+            if 'proxies' not in current or not isinstance(current['proxies'], dict):
+                current['proxies'] = {}
+            proxies = current['proxies']
+            # Docker 期望的键名采用连字符
+            if http_p:
+                proxies['http-proxy'] = http_p
+            else:
+                proxies.pop('http-proxy', None)
+            if https_p:
+                proxies['https-proxy'] = https_p
+            else:
+                proxies.pop('https-proxy', None)
+            if no_p:
+                proxies['no-proxy'] = no_p
+            else:
+                proxies.pop('no-proxy', None)
+
+            # 写入临时文件并安装
+            tmp_json = "/tmp/daemon.json"
+            data = _json.dumps(current, indent=2)
+            if not self.ssh_manager.sftp:
+                self.ssh_manager.sftp = self.ssh_manager.client.open_sftp()
+            with self.ssh_manager.sftp.file(tmp_json, 'w') as f:
+                f.write(data)
+            self.ssh_manager.sftp.chmod(tmp_json, 0o644)
+
+            cmds = [
+                f"mkdir -p {daemon_dir}",
+                f"install -o root -g root -m 644 {tmp_json} {daemon_file}",
+                "systemctl restart docker || service docker restart || true",
+            ]
+            all_ok = True
+            for c in cmds:
+                ok, _o, _e = self.ssh_manager.execute_command(c, realtime_output=False)
+                if not ok:
+                    all_ok = False
+            if all_ok:
+                console.print("✅ Docker 守护进程代理已配置/更新", style="green")
+                return True
+            console.print("⚠️  Docker 代理配置命令部分失败（已尝试继续）", style="yellow")
+            return False
+        except Exception as e:
+            console.print(f"❌ 配置 Docker 守护进程代理失败: {e}", style="red")
+            return False
+        finally:
+            self.ssh_manager.disconnect()
+
     def upload_remote_lib(self, host: str, port: int, username: str, password: str, 
-                         local_lib_path: str) -> bool:
+                         local_lib_path: str, env: Optional[Dict[str, str]] = None) -> bool:
         """上传远程执行库"""
         try:
             # 建立连接
@@ -750,11 +933,11 @@ class RemoteExecutor:
             
             # 检查并安装 Ray
             console.print("🔍 检查 Ray 安装状态...", style="cyan")
-            success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py _check_ray", realtime_output=False)
+            success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py _check_ray", realtime_output=False, extra_env=env)
             
             if not success:
                 console.print("📦 Ray 未安装，开始自动安装...", style="yellow")
-                success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py _install_ray")
+                success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py _install_ray", extra_env=env)
                 
                 if success:
                     console.print("✅ Ray 安装成功", style="green")
@@ -776,7 +959,7 @@ class RemoteExecutor:
         finally:
             self.ssh_manager.disconnect()
     
-    def check_ray_status(self, host: str, port: int, username: str, password: str) -> str:
+    def check_ray_status(self, host: str, port: int, username: str, password: str, env: Optional[Dict[str, str]] = None) -> str:
         """检查 Ray 状态"""
         try:
             # 建立连接
@@ -784,7 +967,7 @@ class RemoteExecutor:
                 return "❌ 连接失败"
             
             # 执行状态检查命令
-            success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py status")
+            success, stdout, stderr = self.ssh_manager.execute_command("python3 /tmp/remote_lib/ray_remote.py status", extra_env=env)
             
             if success:
                 return "✅ 运行中"

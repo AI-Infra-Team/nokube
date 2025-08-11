@@ -40,3 +40,5 @@ kubectl port-forward svc/sing-box 7890:7890 &
 
 
 
+
+

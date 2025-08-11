@@ -130,6 +130,11 @@ class EtcdManager:
                     console.print(f"⚠️  集群 {name} 已存在", style="yellow")
                     return False
             
+            # 衍生元数据：为每个节点提取代理环境变量
+            metadata = {
+                'node_proxy_env': self._derive_node_proxy_env(config)
+            }
+
             # 添加新集群
             new_cluster = {
                 'name': name,
@@ -138,7 +143,8 @@ class EtcdManager:
                 'status': 'inactive',  # 默认未启动
                 'created_at': self._get_timestamp(),
                 'nodes': config.get('nodes', []),  # 节点列表
-                'users': config.get('users', [])  # 用户列表
+                'users': config.get('users', []),  # 用户列表
+                'metadata': metadata,
             }
             
             clusters.append(new_cluster)
@@ -161,8 +167,18 @@ class EtcdManager:
             
             for cluster in clusters:
                 if cluster.get('name') == name:
+                    # 计算配置变更摘要
+                    old_config = cluster.get('config', {}) or {}
+                    change_summary = self._summarize_config_changes(old_config, config)
                     cluster['config'] = config
                     cluster['updated_at'] = self._get_timestamp()
+                    # 同步更新元数据（代理环境）
+                    metadata = cluster.get('metadata', {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    metadata['node_proxy_env'] = self._derive_node_proxy_env(config)
+                    metadata['change_summary'] = change_summary
+                    cluster['metadata'] = metadata
                     
                     self.client.put(self.clusters_key, json.dumps(clusters).encode('utf-8'))
                     console.print(f"✅ 集群 {name} 更新成功", style="green")
@@ -328,6 +344,10 @@ class EtcdManager:
             
             cluster_type = cluster.get('type', 'unknown')
             cluster_config = cluster.get('config', {})
+            # 将 etcd 中的元数据注入到配置，便于后续管理器读取
+            if isinstance(cluster_config, dict):
+                cluster_config = dict(cluster_config)  # 复制，避免影响存储
+                cluster_config['_nokube_metadata'] = cluster.get('metadata', {}) or {}
             
             if cluster_type == 'ray':
                 # 启动 Ray 集群
@@ -354,6 +374,110 @@ class EtcdManager:
         except Exception as e:
             console.print(f"❌ 启动集群失败: {e}", style="red")
             return False
+
+    def _derive_node_proxy_env(self, config: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+        """从集群配置中提取每个节点的代理环境映射，键为 ssh_url。
+
+        仅收集存在的字段，支持大小写 http_proxy/https_proxy/no_proxy。
+        """
+        result: Dict[str, Dict[str, str]] = {}
+        try:
+            for node in config.get('nodes', []) or []:
+                ssh_url = node.get('ssh_url')
+                if not ssh_url:
+                    continue
+                proxy_cfg = node.get('proxy') or {}
+                if not isinstance(proxy_cfg, dict) or not proxy_cfg:
+                    continue
+                env: Dict[str, str] = {}
+                for key in (
+                    'http_proxy', 'https_proxy', 'no_proxy',
+                    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'
+                ):
+                    val = proxy_cfg.get(key)
+                    if val:
+                        env[key] = str(val)
+                if env:
+                    # 以 ssh_url 和 节点 name 双键保存，方便通过任一键查找
+                    result[ssh_url] = env
+                    node_name = node.get('name')
+                    if node_name:
+                        result[node_name] = env
+        except Exception as _:
+            pass
+        return result
+
+    def _summarize_config_changes(self, old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+        """汇总配置变更，标记是否需要重启。
+
+        关注字段：
+        - 节点级：proxy(http/https/no_proxy) 变更（不需要重启）
+        - 节点级：ray_config.port / dashboard_port 变更（需要重启）
+        - 节点级：ssh_url 变化、新增/删除节点（需要重启）
+        - 其余字段仅记录摘要
+        """
+        summary: Dict[str, Any] = {
+            'requires_restart': False,
+            'nodes': {}
+        }
+        try:
+            old_nodes = old.get('nodes', []) or []
+            new_nodes = new.get('nodes', []) or []
+            # 使用 ssh_url 作为键；若缺失则使用 name
+            def key_of(n: Dict[str, Any]) -> str:
+                return n.get('ssh_url') or f"name:{n.get('name','')}"
+
+            old_map = {key_of(n): n for n in old_nodes}
+            new_map = {key_of(n): n for n in new_nodes}
+
+            # 检查新增/删除
+            removed = set(old_map.keys()) - set(new_map.keys())
+            added = set(new_map.keys()) - set(old_map.keys())
+            if removed or added:
+                summary['requires_restart'] = True
+                if removed:
+                    summary['removed_nodes'] = list(sorted(removed))
+                if added:
+                    summary['added_nodes'] = list(sorted(added))
+
+            # 检查相同键的节点变更
+            for k in set(old_map.keys()) & set(new_map.keys()):
+                o = old_map[k] or {}
+                n = new_map[k] or {}
+                node_changes: Dict[str, Any] = {}
+                # 代理变更（不需重启）
+                def proxy_env(d: Dict[str, Any]) -> Dict[str, str]:
+                    p = d.get('proxy') or {}
+                    env = {}
+                    for kk in ('http_proxy','https_proxy','no_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY'):
+                        if p.get(kk):
+                            env[kk] = str(p.get(kk))
+                    return env
+                pe_old = proxy_env(o)
+                pe_new = proxy_env(n)
+                if pe_old != pe_new:
+                    node_changes['proxy_changed'] = {'old': pe_old, 'new': pe_new}
+                # 端口变更（需要重启）
+                rc_old = (o.get('ray_config') or {})
+                rc_new = (n.get('ray_config') or {})
+                port_old = rc_old.get('port')
+                port_new = rc_new.get('port')
+                dash_old = rc_old.get('dashboard_port')
+                dash_new = rc_new.get('dashboard_port')
+                port_delta: Dict[str, Any] = {}
+                if port_old != port_new:
+                    port_delta['port'] = {'old': port_old, 'new': port_new}
+                if dash_old != dash_new:
+                    port_delta['dashboard_port'] = {'old': dash_old, 'new': dash_new}
+                if port_delta:
+                    node_changes['ray_port_changed'] = port_delta
+                    summary['requires_restart'] = True
+                if node_changes:
+                    summary['nodes'][k] = node_changes
+        except Exception:
+            # 容错处理，出现异常时不阻断更新
+            pass
+        return summary
 
 
 if __name__ == '__main__':

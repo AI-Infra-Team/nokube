@@ -17,20 +17,27 @@ spec:
     spec:
       containers:
       - name: git-watcher
-        image: nokube/git-watcher:latest
+        image: python:3.10
+        imagePullPolicy: IfNotPresent
         env:
         - name: CONFIG_PATH
           value: "/app/config/repos.yaml"
         - name: LOG_LEVEL
           value: "INFO"
+        command: ["/bin/sh","-lc"]
+        args:
+          - >-
+            set -e;
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*;
+            git clone https://github.com/nokube/nokube.git /opt/nokube || true;
+            cd /opt/nokube;
+            pip install --no-cache-dir -e .;
+            python examples/git-watcher/start_watcher.py --config "$CONFIG_PATH";
         volumeMounts:
         - name: config-volume
           mountPath: /app/config
         - name: data-volume
           mountPath: /app/data
-        - name: ssh-keys
-          mountPath: /app/ssh
-          readOnly: true
         resources:
           requests:
             memory: "128Mi"
@@ -42,7 +49,6 @@ spec:
       - name: config-volume
         secret:
           secretName: git-watcher-config
-      # 不再挂载凭据文件，全部在 repos.yaml 内内联提供
       - name: data-volume
         persistentVolumeClaim:
           claimName: git-watcher-data

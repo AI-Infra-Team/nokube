@@ -30,12 +30,11 @@ def main():
     
     # 设置日志级别
     os.environ['LOG_LEVEL'] = args.log_level
-    
-    console.print("🚀 启动 Git 仓库监控服务", style="blue")
-    console.print(f"使用配置: {config_file}", style="cyan")
-    
+
     # 检查配置文件
     config_file = args.config
+    console.print("🚀 启动 Git 仓库监控服务", style="blue")
+    console.print(f"使用配置: {config_file}", style="cyan")
     if not os.path.exists(config_file):
         console.print(f"❌ 配置文件不存在: {config_file}", style="red")
         console.print("请确保配置文件存在或使用 --config 参数指定", style="yellow")

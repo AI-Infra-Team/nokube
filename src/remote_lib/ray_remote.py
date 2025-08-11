@@ -13,7 +13,7 @@ import json
 import getpass
 import logging
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 
 # Global logging setup
 _log_file = None
@@ -192,6 +192,14 @@ class RayRemoteManager:
             if not self._install_ray_if_needed():
                 print("❌ Unable to install Ray, startup failed")
                 return False
+            
+            # Idempotent: if already running, treat as success
+            try:
+                if self.is_running():
+                    print("✅ Ray head is already running; skipping start")
+                    return True
+            except Exception:
+                pass
             # Show which ray and version on remote
             ok_path, out_path, _ = self.run_cmd_with_result("which ray")
             if ok_path and out_path.strip():
@@ -221,8 +229,16 @@ class RayRemoteManager:
                 cmd.insert(3, f"--node-ip-address={node_ip_address}")
             
             print(f"Executing command: {' '.join(cmd)}")
-            res= self.run_cmd_with_progress(" ".join(cmd))
+            res = self.run_cmd_with_progress(" ".join(cmd))
 
+            if not res:
+                # If failing because already running, still treat as success
+                try:
+                    if self.is_running():
+                        print("✅ Ray appears to be already running; considering start successful")
+                        return True
+                except Exception:
+                    pass
             return res
         except Exception as e:
             print(f"❌ Failed to start Ray Head node: {e}")
@@ -237,6 +253,14 @@ class RayRemoteManager:
             if not self._install_ray_if_needed():
                 print("❌ Unable to install Ray, startup failed")
                 return False
+            
+            # Idempotent: if ray process already running, skip
+            try:
+                if self.is_running():
+                    print("✅ Ray worker is already running; skipping start")
+                    return True
+            except Exception:
+                pass
             # Show which ray and version on remote
             ok_path, out_path, _ = self.run_cmd_with_result("which ray")
             if ok_path and out_path.strip():
@@ -252,7 +276,15 @@ class RayRemoteManager:
             ]
             
             print(f"Executing command: {' '.join(cmd)}")
-            return self.run_cmd_with_progress(" ".join(cmd))
+            ok = self.run_cmd_with_progress(" ".join(cmd))
+            if not ok:
+                try:
+                    if self.is_running():
+                        print("✅ Ray appears to be already running; considering start successful")
+                        return True
+                except Exception:
+                    pass
+            return ok
                 
         except Exception as e:
             print(f"❌ Failed to start Ray Worker node: {e}")
@@ -299,6 +331,20 @@ class RayRemoteManager:
                 
         except Exception as e:
             return f"Failed to get logs: {e}"
+
+    # ---------------- NodeConfigActor (daemonset-like) -----------------
+    # Keep method for backwards compatibility; prefer CLI subcommand
+    def start_config_actor(self, interval_sec: int = 60, extra_env: Optional[dict] = None) -> bool:
+        try:
+            env = {**(extra_env or {})}
+            # 直接调用 CLI 子命令。幂等逻辑在子命令内部完成（基于命名空间与具名 actor）
+            return self.run_cmd_with_progress(
+                f"python3 /tmp/remote_lib/ray_remote.py start-config-actor --interval {int(interval_sec)}",
+                extra_env=env,
+            )
+        except Exception as e:
+            print(f"❌ start_config_actor failed: {e}")
+            return False
 
     def run_cmd_with_progress(self, command: str, timeout: Optional[int] = None, extra_env: Optional[dict] = None) -> bool:
         """Execute command with real-time progress display. Supports injecting env via extra_env."""
@@ -400,6 +446,9 @@ def main() -> None:
     
     # status command
     subparsers.add_parser("status", help="Check Ray status")
+    # start-config-actor command
+    sca_parser = subparsers.add_parser("start-config-actor", help="Start NodeConfigActor on this node")
+    sca_parser.add_argument("--interval", type=int, default=60, help="Sync interval seconds")
     
     # logs command
     logs_parser = subparsers.add_parser("logs", help="Get logs")
@@ -478,6 +527,159 @@ def main() -> None:
         # Install Ray
         success = manager._install_ray_if_needed()
         sys.exit(0 if success else 1)
+    elif args.command == "start-config-actor":
+        # Implement NodeConfigActor in this script
+        # Lazy import to avoid overhead
+        try:
+            import os, socket, time, json, subprocess
+            # Ensure required python libs and protobuf version (pin to avoid descriptor errors)
+            pkgs = [
+                "tenacity==6.1.0",
+                "etcd3==0.12.0",
+                "protobuf<=3.20.4",
+            ]
+            manager.run_cmd_with_progress("python3 -m pip install --user " + " ".join(f"'{p}'" for p in pkgs))
+            try:
+                import etcd3  # type: ignore
+            except Exception:
+                print("❌ etcd3 import still failing after install")
+                sys.exit(1)
+
+            import ray
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            NODE_NAME = socket.gethostname()
+            INTERVAL = int(args.interval)
+            ETCD_HOSTS = os.environ.get('NOKUBE_ETCD_HOSTS', '127.0.0.1:2379')
+            ETCD_USER = os.environ.get('NOKUBE_ETCD_USER')
+            ETCD_PASS = os.environ.get('NOKUBE_ETCD_PASS')
+            ETCD_PREFIX = os.environ.get('NOKUBE_ETCD_PREFIX', '/nokube')
+
+            def _get_etcd_client():
+                host = ETCD_HOSTS.split(',')[0].split(':')[0]
+                port = int(ETCD_HOSTS.split(',')[0].split(':')[1])
+                kwargs = {'host': host, 'port': port}
+                if ETCD_USER:
+                    kwargs['user'] = ETCD_USER
+                if ETCD_PASS:
+                    kwargs['password'] = ETCD_PASS
+                try:
+                    return etcd3.client(**kwargs)
+                except Exception:
+                    return None
+
+            def _mask(env_map: Dict[str, str]):
+                items = []
+                try:
+                    from urllib.parse import urlparse
+                    for key in ('http_proxy','https_proxy','no_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY'):
+                        val = env_map.get(key)
+                        if not val:
+                            continue
+                        if key.lower()=="no_proxy":
+                            parts=[s.strip() for s in str(val).split(',') if s.strip()]
+                            preview=','.join(parts[:5]); suf='' if len(parts)<=5 else f"(+{len(parts)-5})"
+                            items.append(f"{key}={preview}{suf}")
+                        else:
+                            try:
+                                p=urlparse(str(val)); host=p.hostname or ''; port=f":{p.port}" if p.port else ''
+                                items.append(f"{key}={p.scheme}://{host}{port}")
+                            except Exception:
+                                items.append(f"{key}={val}")
+                except Exception:
+                    pass
+                return items
+
+            @ray.remote
+            class _NodeCfg:
+                def __init__(self, node_name: str, interval: int):
+                    self.node_name=node_name
+                    self.interval=interval
+                    self.last_env={}
+                    self.etcd=_get_etcd_client()
+
+                def _fetch(self) -> Dict[str,str]:
+                    try:
+                        if not self.etcd:
+                            return {}
+                        key=f"{ETCD_PREFIX}/clusters"
+                        val,_ = self.etcd.get(key)
+                        if not val:
+                            return {}
+                        clusters=json.loads(val.decode('utf-8'))
+                        for c in clusters:
+                            meta=c.get('metadata') or {}
+                            mapping=meta.get('node_proxy_env') or {}
+                            if self.node_name in mapping and isinstance(mapping[self.node_name], dict):
+                                env={}
+                                for k in ('http_proxy','https_proxy','no_proxy','HTTP_PROXY','HTTPS_PROXY','NO_PROXY'):
+                                    v=mapping[self.node_name].get(k)
+                                    if v:
+                                        env[k]=str(v)
+                                return env
+                        return {}
+                    except Exception:
+                        return {}
+
+                def _apply(self, env_map: Dict[str,str]) -> bool:
+                    try:
+                        if env_map==self.last_env:
+                            return True
+                        daemon_dir='/etc/docker'
+                        daemon_file=f"{daemon_dir}/daemon.json"
+                        # read
+                        r=subprocess.run(["bash","-lc",f"cat {daemon_file}"], capture_output=True, text=True)
+                        try:
+                            cur=json.loads(r.stdout) if r.returncode==0 and r.stdout.strip() else {}
+                        except Exception:
+                            cur={}
+                        cur.setdefault('proxies',{})
+                        pr=cur['proxies']
+                        def n(key):
+                            return env_map.get(key) or env_map.get(key.upper()) or env_map.get(key.lower())
+                        hp=n('http_proxy'); sp=n('https_proxy'); np=n('no_proxy')
+                        if hp: pr['http-proxy']=hp
+                        elif 'http-proxy' in pr: pr.pop('http-proxy')
+                        if sp: pr['https-proxy']=sp
+                        elif 'https-proxy' in pr: pr.pop('https-proxy')
+                        if np: pr['no-proxy']=np
+                        elif 'no-proxy' in pr: pr.pop('no-proxy')
+                        tmp='/tmp/daemon.json'; open(tmp,'w').write(json.dumps(cur,indent=2))
+                        pref=[] if os.geteuid()==0 else ['sudo','-E','-n']
+                        for c in [f"mkdir -p {daemon_dir}", f"install -o root -g root -m 644 {tmp} {daemon_file}", "systemctl restart docker || service docker restart || true"]:
+                            subprocess.run(pref+["bash","-lc",c],text=True)
+                        self.last_env=dict(env_map)
+                        print("CFG | updated:", ', '.join(_mask(env_map)))
+                        return True
+                    except Exception as e:
+                        print("CFG | apply failed:", e)
+                        return False
+
+                def run(self):
+                    print(f"CFG | NodeConfigActor running on {self.node_name}, interval={self.interval}s")
+                    while True:
+                        env=self._fetch()
+                        if env:
+                            self._apply(env)
+                        time.sleep(self.interval)
+
+            NS=os.environ.get('NOKUBE_NAMESPACE','nokube')
+            # 优先 RAY_ADDRESS（由上游注入），否则 auto
+            addr=os.environ.get('RAY_ADDRESS') or 'auto'
+            ray.init(address=addr, namespace=NS)
+            nid=ray.get_runtime_context().get_node_id()
+            name=f"nokube-config-{NODE_NAME}"
+            try:
+                a=ray.get_actor(name, namespace=NS)
+                print("CFG | actor already exists:", name)
+            except Exception:
+                a=_NodeCfg.options(name=name, lifetime="detached", scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=nid, soft=True)).remote(NODE_NAME, INTERVAL)
+                a.run.remote()
+            print("CFG | ensure done for:", name)
+            sys.exit(0)
+        except Exception as e:
+            print(f"❌ failed to start-config-actor: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
