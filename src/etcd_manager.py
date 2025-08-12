@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-etcd 集群管理器
-用于存储和管理 NoKube 集群列表
-专注于 etcd 作为唯一存储后端
+Etcd Manager
+Store and manage NoKube cluster metadata using etcd as the only backend
 """
 
 import json
@@ -18,7 +17,7 @@ console = Console()
 
 
 class EtcdManager:
-    """etcd 集群管理器"""
+    """etcd manager"""
     
     def __init__(self, etcd_hosts: Optional[str] = None):
         # 获取全局配置
@@ -107,6 +106,45 @@ class EtcdManager:
         except Exception as e:
             console.print(f"❌ 从 etcd 读取集群列表失败: {e}", style="red")
             raise RuntimeError(f"Failed to read clusters from etcd: {e}")
+
+    # ---- 通用 KV 接口：供控制器/部署逻辑使用 ----
+    def set_kv(self, key: str, value: Any) -> None:
+        """将任意值写入 etcd 指定键。
+        - 对 dict/list 统一序列化为 JSON；其余按字符串写入
+        - 写入失败直接抛出异常
+        """
+        if not self.client:
+            raise RuntimeError("etcd client not available")
+        try:
+            if isinstance(value, (dict, list)):
+                data = json.dumps(value, ensure_ascii=False).encode('utf-8')
+            elif isinstance(value, (bytes, bytearray)):
+                data = bytes(value)
+            else:
+                data = str(value).encode('utf-8')
+            self.client.put(key, data)
+        except Exception as e:
+            console.print(f"❌ 写入 etcd 失败: key={key} err={e}", style="red")
+            raise RuntimeError(f"failed to set etcd key {key}: {e}")
+
+    def get_kv(self, key: str) -> Any:
+        """从 etcd 读取值；若内容为 JSON 则反序列化返回，否则返回字符串。
+        - 读取失败直接抛出异常
+        """
+        if not self.client:
+            raise RuntimeError("etcd client not available")
+        try:
+            value, _ = self.client.get(key)
+            if value is None:
+                return None
+            raw = value.decode('utf-8')
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+        except Exception as e:
+            console.print(f"❌ 读取 etcd 失败: key={key} err={e}", style="red")
+            raise RuntimeError(f"failed to get etcd key {key}: {e}")
     
     def get_cluster(self, name: str) -> Optional[Dict[str, Any]]:
         """获取指定集群信息"""
@@ -363,6 +401,13 @@ class EtcdManager:
                     # 更新集群状态
                     self.set_cluster_status(name, 'running')
                     console.print(f"✅ Ray 集群 {name} 启动成功", style="green")
+                    
+                    # 自动确保系统 config DaemonSet
+                    try:
+                        self._ensure_system_config_daemonset(cluster_config)
+                    except Exception as e:
+                        console.print(f"⚠️  系统 config DaemonSet 启动失败: {e}", style="yellow")
+                    
                     return True
                 else:
                     console.print(f"❌ Ray 集群启动失败", style="red")
@@ -374,6 +419,79 @@ class EtcdManager:
         except Exception as e:
             console.print(f"❌ 启动集群失败: {e}", style="red")
             return False
+
+    def _ensure_system_config_daemonset(self, cluster_config: Dict[str, Any]) -> None:
+        """确保系统 config DaemonSet 在集群启动后自动运行"""
+        try:
+            # Get head node info from cluster config (same logic as RayClusterManager)
+            nodes = cluster_config.get('nodes', []) or []
+            head_node = None
+            for node in nodes:
+                if (node.get('role') or '').lower() == 'head':
+                    head_node = node
+                    break
+            if head_node is None and nodes:
+                head_node = nodes[0]  # fallback to first node
+            
+            if not head_node or not head_node.get('ssh_url'):
+                console.print("⚠️  未找到 head 节点信息，跳过系统 config DaemonSet", style="yellow")
+                return
+            
+            # Use RemoteExecutor to leverage existing remote_lib infrastructure
+            from src.ssh_manager import RemoteExecutor
+            from pathlib import Path
+            
+            ssh_url = str(head_node.get('ssh_url'))
+            host = ssh_url.split(':')[0]
+            port = int(ssh_url.split(':')[1]) if ':' in ssh_url else 22
+            
+            # Get user credentials (same logic as RayClusterManager)
+            users = head_node.get("users", []) or []
+            if not users:
+                console.print("⚠️  head 节点缺少 users 信息，跳过系统 config DaemonSet", style="yellow")
+                return
+            
+            user = users[0]
+            username = user.get("userid", "root")
+            password = user.get("password")
+            
+            # Get cluster metadata for proxy env
+            cluster_meta = cluster_config.get("_nokube_metadata", {}) or {}
+            
+            # Merge proxy environment (same as RayClusterManager._merge_proxy_env logic)
+            env = {}
+            # Get node-level proxy config
+            for key in ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]:
+                if key in head_node:
+                    env[key] = str(head_node[key])
+            # Get cluster-level proxy config from metadata
+            node_proxy_env = cluster_meta.get("node_proxy_env", {}) or {}
+            ssh_key = f"{host}:{port}"
+            if ssh_key in node_proxy_env:
+                env.update(node_proxy_env[ssh_key])
+            
+            # Ensure remote_lib is uploaded (reuse existing logic)
+            remote_executor = RemoteExecutor()
+            remote_lib_path = Path(__file__).resolve().parent / "remote_lib"
+            
+            if not remote_executor.upload_remote_lib(host, port, username, password, str(remote_lib_path), env=env):
+                console.print("⚠️  remote_lib 上传失败，跳过系统 config DaemonSet", style="yellow")
+                return
+            
+            # Execute Ray command to ensure system config DaemonSet
+            success = remote_executor.execute_ray_command_with_logging(
+                host, port, username, password, 
+                command="ensure-system-config",
+                env=env
+            )
+            
+            if success:
+                console.print("✅ 系统 config DaemonSet 已确保（通过 SSH）", style="green")
+            else:
+                console.print("⚠️  系统 config DaemonSet 启动失败", style="yellow")
+                
+        except Exception as e:
+            console.print(f"⚠️  系统 config DaemonSet 启动失败: {e}", style="yellow")
 
     def _derive_node_proxy_env(self, config: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
         """从集群配置中提取每个节点的代理环境映射，键为 ssh_url。
@@ -529,4 +647,4 @@ if __name__ == '__main__':
         manager.export_clusters_to_yaml(yaml_file)
     else:
         console.print(f"❌ 未知命令: {command}", style="red")
-        sys.exit(1) 
+        sys.exit(1)

@@ -57,6 +57,14 @@ def _compose_container_actor_name(ns: str, pod: str, container_name: str) -> str
     ])
 
 
+def _workload_segment(name: Optional[str]) -> str:
+    """返回工作负载段名；为空时使用 'standalone'。"""
+    try:
+        return _safe_name(name) if name else "standalone"
+    except Exception:
+        return "standalone"
+
+
 def _log(prefix: str, message: str):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {prefix} | {message}", flush=True)
@@ -299,17 +307,33 @@ class NodeConfigActor:
 class ContainerActor:
     """容器级 Actor：最小实现，使用 docker SDK 运行容器。"""
 
-    def __init__(self, pod_name: str, namespace: str, container: Dict[str, Any], actor_name: str):
+    def __init__(self, pod_name: str, namespace: str, container: Dict[str, Any], actor_name: str, parent_deployment: Optional[str] = None):
         self.pod_name = pod_name
         self.namespace = namespace
         self.container = container
         self.actor_name = actor_name
+        self.parent_deployment = parent_deployment or "standalone"
         self.status = "Pending"
         self.container_id: Optional[str] = None
         self.container_name: str = _safe_name(actor_name)
         self._proc: Optional[subprocess.Popen] = None
         self._io_thread: Optional[threading.Thread] = None
         self._stop_stream: bool = False
+
+    def full_path(self, include_container: bool = False, include_namespace: bool = True) -> str:
+        """返回容器/Pod 的稳定路径段：namespace/workload/pod[/container]
+        - workload 为空时回退为 standalone
+        - include_container=True 时追加容器名
+        - include_namespace=False 时去掉开头 namespace 段
+        """
+        ns = _safe_name(self.namespace)
+        workload = _workload_segment(self.parent_deployment)
+        pod = _safe_name(self.pod_name)
+        parts = [ns, workload, pod] if include_namespace else [workload, pod]
+        if include_container:
+            cname = _safe_name(self.container.get("name", "container"))
+            parts.append(cname)
+        return "/".join(parts)
 
     def start(self, attempts: int = 5, backoff_seconds: float = 3.0, stream_logs: bool = True) -> Dict[str, Any]:
         # 开头打印当前进程可见的代理环境摘要
@@ -351,6 +375,27 @@ class ContainerActor:
                     port_args.extend(["-p", port_val])
             return port_args
 
+        def _build_volume_args() -> List[str]:
+            vol_args: List[str] = []
+            # 将 K8s 风格 volumeMounts 映射到 docker -v host:container
+            mounts = self.container.get("volumeMounts", []) or []
+            # 以 namespace/workload/pod 解析到宿主路径，并为每个容器形成唯一 mount 点
+            base = f"/var/lib/nokube/volumes/{self.full_path(include_container=False, include_namespace=True)}"
+            for m in mounts:
+                mpath = m.get("mountPath")
+                vname = m.get("name")
+                if not mpath or not vname:
+                    continue
+                pod_vol_dir = os.path.join(base, _safe_name(vname))
+                try:
+                    # 确保 pod 级数据目录存在；直接使用该目录进行挂载
+                    os.makedirs(pod_vol_dir, exist_ok=True)
+                except Exception:
+                    pass
+                host_dir = pod_vol_dir
+                vol_args.extend(["-v", f"{host_dir}:{mpath}"])
+            return vol_args
+
         def _build_final_cmd() -> List[str]:
             cmd = self.container.get("command") or []
             args = self.container.get("args") or []
@@ -367,12 +412,14 @@ class ContainerActor:
             # 优先 sudo + docker CLI（非交互）
             env_dict = _build_env_dict()
             port_args = _build_ports_list()
+            volume_args = _build_volume_args()
             final_cmd = _build_final_cmd()
 
             run_args: List[str] = _sudo_prefix() + ["docker", "run", "--rm", "--name", self.container_name]
             for k, v in env_dict.items():
                 run_args.extend(["-e", f"{k}={v}"])
             run_args.extend(port_args)
+            run_args.extend(volume_args)
             run_args.append(image)
             run_args.extend(final_cmd)
 
@@ -397,6 +444,18 @@ class ContainerActor:
                 pass
             # 执行并打印状态
             start_ts = time.time()
+            # 先尝试移除同名遗留容器，避免名称冲突
+            try:
+                sp = _sudo_prefix()
+                _log(f"CTR {self.actor_name}", f"docker rm -f {self.container_name}")
+                pre = subprocess.run(sp + ["docker", "rm", "-f", self.container_name], capture_output=True, text=True)
+                try:
+                    stderr_tail = (pre.stderr or '').strip()[:300]
+                    _log(f"CTR {self.actor_name}", f"pre-clean exit={pre.returncode} err={stderr_tail}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
             try:
                 # 前台运行并实时读取输出
                 self._proc = subprocess.Popen(
@@ -555,6 +614,8 @@ class PodActor:
         containers: List[Dict[str, Any]],
         actor_name: str,
         spec_key: Optional[str] = None,
+        parent_deployment: Optional[str] = None,
+        volumes: Optional[List[Dict[str, Any]]] = None,
     ):
         self.pod_name = pod_name
         self.namespace = namespace
@@ -569,8 +630,24 @@ class PodActor:
         self._status_thread: Optional[threading.Thread] = None
         self._container_status: Dict[str, Dict[str, Any]] = {}
         self.spec_key = spec_key
+        self.deployment_name = parent_deployment or "standalone"
         self._etcd = _try_create_etcd()
         self._last_generation: Optional[int] = None
+        # 已物化的卷缓存，避免重复创建
+        self._materialized_volumes: Dict[str, bool] = {}
+        # 初始卷（来自 K8s 资源 spec.volumes）
+        self.initial_volumes: List[Dict[str, Any]] = list(volumes or [])
+
+    def full_path(self, include_namespace: bool = True) -> str:
+        """返回 Pod 的稳定路径段：namespace/workload/pod
+        - workload 使用 deployment_name，为空回退为 standalone
+        - include_namespace=False 时不含命名空间段
+        """
+        ns = _safe_name(self.namespace)
+        workload = _workload_segment(self.deployment_name)
+        pod = _safe_name(self.pod_name)
+        parts = [ns, workload, pod] if include_namespace else [workload, pod]
+        return "/".join(parts)
 
     def _supervise_container(self, container_spec: Dict[str, Any]):
         c_name = _safe_name(container_spec.get("name", "container"))
@@ -628,11 +705,11 @@ class PodActor:
                     namespace=ns,
                     detached=False,
                     replace_existing=True,
-                    ctor_args=(self.pod_name, self.namespace, latest_spec, c_actor_name),
+                    ctor_args=(self.pod_name, self.namespace, latest_spec, c_actor_name, self.deployment_name),
                     stop_method="stop",
                     stop_timeout=10,
                 )
-                result = ray.get(actor.start.remote(attempts=1, backoff_seconds=1.0))
+                result = ray.get(actor.start.remote(attempts=3, backoff_seconds=2.0))
                 self._container_status[c_name] = result
                 if result.get("status") == "Running":
                     # 记录为该容器的唯一实例
@@ -642,6 +719,7 @@ class PodActor:
                     backoff = 10.0
                     sleep_secs = 15.0
                 else:
+                    # 失败时按 backoff 睡眠后重试
                     backoff = min(backoff * 2, 60.0)
                     sleep_secs = backoff
             except Exception as e:
@@ -670,6 +748,20 @@ class PodActor:
                 _log(f"POD {self.actor_name}", f"proxy env: {', '.join(proxy_items)}")
         except Exception:
             pass
+        # 若存在外部规格存储（spec_key），优先在拉起容器前物化卷，避免容器启动时文件尚未就绪
+        try:
+            desired_volumes: List[Dict[str, Any]] = []
+            if self.initial_volumes:
+                desired_volumes.extend(self.initial_volumes)
+            if self.spec_key and self._etcd is not None:
+                data = self._etcd.get_kv(self.spec_key)
+                if isinstance(data, dict):
+                    desired_volumes.extend(data.get("volumes", []) or [])
+            if desired_volumes:
+                self._ensure_volumes(desired_volumes)
+        except Exception:
+            pass
+
         # 为每个容器启动监督线程：失败不退出，sleep 一会再重启
         self.status = "Running"
         for c in self.containers:
@@ -732,6 +824,9 @@ class PodActor:
                             gen = int(data.get("generation", 0))
                             if self._last_generation is None or gen != self._last_generation:
                                 desired_containers = data.get("containers", []) or []
+                                desired_volumes = data.get("volumes", []) or []
+                                # 物化声明式卷到宿主（仅支持 hostPath、ConfigMap、Secret 的最小子集）
+                                self._ensure_volumes(desired_volumes)
                                 # 变更摘要
                                 cur_names = {c.get("name") for c in (self.containers or []) if c.get("name")}
                                 des_names = {c.get("name") for c in desired_containers if c.get("name")}
@@ -776,6 +871,58 @@ class PodActor:
             except Exception:
                 pass
             time.sleep(1)
+
+    def _ensure_volumes(self, volumes: List[Dict[str, Any]]):
+        """在本节点物化卷内容，并为后续容器挂载准备 hostPath 路径。
+        - 支持 ConfigMap/Secret 简化模式：从 etcd /nokube/{configmaps|secrets}/<ns>/<name> 读取数据，
+          写入到 /var/lib/nokube/volumes/<ns>/<deploy>/<pod>/<volName>/ 下（pod 级唯一）。
+        - 支持 hostPath 直透（确保目录存在）。
+        """
+        try:
+            base = f"/var/lib/nokube/volumes/{self.full_path(include_namespace=True)}"
+            os.makedirs(base, exist_ok=True)
+            for v in volumes or []:
+                vname = v.get("name")
+                if not vname:
+                    continue
+                if self._materialized_volumes.get(vname):
+                    continue
+                target = os.path.join(base, _safe_name(vname))
+                src: Dict[str, Any] = v or {}
+                if src.get("configMap") and self._etcd is not None:
+                    cm_name = (src.get("configMap") or {}).get("name")
+                    if cm_name:
+                        data = self._etcd.get_kv(f"/nokube/configmaps/{self.namespace}/{cm_name}") or {}
+                        os.makedirs(target, exist_ok=True)
+                        for k, val in (data or {}).items():
+                            try:
+                                with open(os.path.join(target, k), 'w', encoding='utf-8') as f:
+                                    f.write(str(val))
+                            except Exception:
+                                pass
+                        self._materialized_volumes[vname] = True
+                elif src.get("secret") and self._etcd is not None:
+                    sec_name = (src.get("secret") or {}).get("name")
+                    if sec_name:
+                        data = self._etcd.get_kv(f"/nokube/secrets/{self.namespace}/{sec_name}") or {}
+                        os.makedirs(target, exist_ok=True)
+                        for k, val in (data or {}).items():
+                            try:
+                                with open(os.path.join(target, k), 'w', encoding='utf-8') as f:
+                                    f.write(str(val))
+                            except Exception:
+                                pass
+                        self._materialized_volumes[vname] = True
+                elif src.get("hostPath"):
+                    host_path = (src.get("hostPath") or {}).get("path")
+                    if host_path:
+                        try:
+                            os.makedirs(host_path, exist_ok=True)
+                            self._materialized_volumes[vname] = True
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _reconcile_containers(self, desired: List[Dict[str, Any]]):
         # 基于容器 name 做 diff
@@ -824,11 +971,12 @@ class PodActor:
 class DeploymentActor:
     """Deployment 级 Actor：管理 Pod 子 Actor。"""
 
-    def __init__(self, name: str, namespace: str, replicas: int, containers: List[Dict[str, Any]]):
+    def __init__(self, name: str, namespace: str, replicas: int, containers: List[Dict[str, Any]], volumes: Optional[List[Dict[str, Any]]] = None):
         self.name = name
         self.namespace = namespace
         self.replicas = replicas
         self.containers = containers
+        self.volumes = volumes or []
         self.pods: Dict[str, Any] = {}
         self._stop_flag = False
         self._thread: Optional[threading.Thread] = None
@@ -870,7 +1018,7 @@ class DeploymentActor:
                 namespace=ns,
                 detached=False,
                 replace_existing=True,
-                ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key),
+                ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key, self.name, getattr(self, 'volumes', [])),
                 stop_method="stop",
                 stop_timeout=10,
             )
@@ -949,13 +1097,15 @@ class DeploymentActor:
                         idx += 1
                         continue
                     pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-{idx}"
+                    from src.actor_utils import ensure_actor  # type: ignore
+                    ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
                     pod = ensure_actor(
                         PodActor,
                         pod_actor_name,
                         namespace=ns,
                         detached=False,
                         replace_existing=True,
-                        ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key),
+                        ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, self.spec_key, self.name, getattr(self, 'volumes', [])),
                         stop_method="stop",
                         stop_timeout=10,
                     )
@@ -1071,11 +1221,169 @@ class DeploymentActor:
             try:
                 # 添加 apply 时间戳，作为变更标识
                 applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                payload = {"generation": self._generation, "applied_at": applied_at, "containers": self.containers}
+                payload = {"generation": self._generation, "applied_at": applied_at, "containers": self.containers, "volumes": getattr(self, 'volumes', [])}
                 self._etcd.set_kv(self.spec_key, payload)
                 _log(f"DEP {self.name}", f"publish spec gen={self._generation} replicas={self.replicas} containers={len(self.containers)} applied_at={applied_at}")
             except Exception:
                 pass
+
+@ray.remote
+class DaemonSetActor:
+    """DaemonSet Actor: Manages Pod Actors on each eligible node based on nodeSelector and nodeAffinity"""
+    
+    def __init__(self, name: str, namespace: str, spec: Dict[str, Any]):
+        self.name = name
+        self.namespace = namespace
+        self.spec = spec
+        self.running = False
+        self.pod_actors: Dict[str, Any] = {}  # node -> pod_actor
+        self._etcd = None
+        
+        # Parse template spec
+        template_spec = spec.get("spec", {}).get("template", {}).get("spec", {})
+        self.containers = template_spec.get("containers", [])
+        self.volumes = template_spec.get("volumes", [])
+        self.node_selector = template_spec.get("nodeSelector", {})
+        self.node_affinity = template_spec.get("affinity", {}).get("nodeAffinity", {})
+        
+        # Initialize etcd connection
+        try:
+            from src.etcd_manager import EtcdManager as _EM  # type: ignore
+            self._etcd = _EM()
+        except Exception:
+            self._etcd = None
+    
+    def start(self):
+        """Start DaemonSet supervision"""
+        try:
+            if self.running:
+                return {"status": "already_running"}
+            
+            print(f"🚀 Starting DaemonSet {self.name} in namespace {self.namespace}")
+            self.running = True
+            
+            # Get eligible nodes
+            eligible_nodes = self._get_eligible_nodes()
+            print(f"📋 Eligible nodes for DaemonSet {self.name}: {eligible_nodes}")
+            
+            if not eligible_nodes:
+                print(f"⚠️  No eligible nodes found for DaemonSet {self.name}")
+                return {"status": "no_eligible_nodes"}
+            
+            # Start Pod Actor on each eligible node
+            from src.actor_utils import ensure_actor  # type: ignore
+            ray_ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
+            
+            started_pods = 0
+            for node in eligible_nodes:
+                pod_name = f"{self.name}-pod-{_safe_name(node)}"
+                pod_actor_name = f"pod-{_safe_name(self.namespace)}-{_safe_name(self.name)}-node-{_safe_name(node)}"
+                
+                try:
+                    print(f"🔧 Creating pod {pod_actor_name} on node {node}")
+                    pod_actor = ensure_actor(
+                        PodActor,
+                        pod_actor_name,
+                        namespace=ray_ns,
+                        detached=True,
+                        replace_existing=True,
+                        ctor_args=(pod_name, self.namespace, self.containers, pod_actor_name, node, self.name, self.volumes),
+                        stop_method="stop",
+                        stop_timeout=10,
+                    )
+                    pod_actor.start.remote()
+                    self.pod_actors[node] = pod_actor
+                    started_pods += 1
+                    print(f"✅ Started pod on node {node}: {pod_actor_name}")
+                except Exception as e:
+                    print(f"❌ Failed to start pod on node {node}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            print(f"🎯 DaemonSet {self.name} started {started_pods}/{len(eligible_nodes)} pods")
+            return {"status": "started", "pods": started_pods, "total_nodes": len(eligible_nodes)}
+            
+        except Exception as e:
+            print(f"❌ DaemonSet {self.name} start failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.running = False
+            return {"status": "failed", "error": str(e)}
+    
+    def stop(self):
+        """Stop DaemonSet and all pods"""
+        self.running = False
+        
+        # Stop all pod actors
+        for node, pod_actor in self.pod_actors.items():
+            try:
+                ray.get(pod_actor.stop.remote())
+                _log(f"DS {self.name}", f"Stopped pod on node {node}")
+            except Exception as e:
+                _log(f"DS {self.name}", f"Failed to stop pod on node {node}: {e}")
+        
+        self.pod_actors.clear()
+        return {"status": "stopped"}
+    
+    def _get_eligible_nodes(self) -> List[str]:
+        """Get list of eligible nodes based on nodeSelector and nodeAffinity"""
+        # Get all nodes from etcd cluster metadata
+        all_nodes = self._list_all_nodes()
+        
+        # Filter nodes based on nodeSelector and nodeAffinity
+        eligible_nodes = []
+        for node in all_nodes:
+            if self._node_matches(node):
+                eligible_nodes.append(node)
+        
+        return eligible_nodes
+    
+    def _list_all_nodes(self) -> List[str]:
+        """List all available nodes from etcd cluster metadata"""
+        try:
+            if self._etcd:
+                print(f"🔍 Querying etcd for cluster nodes...")
+                clusters = self._etcd.list_clusters()
+                print(f"📋 Found {len(clusters) if clusters else 0} clusters in etcd")
+                
+                for cluster in clusters:
+                    if cluster.get('status') == 'running':
+                        config = cluster.get('config', {})
+                        nodes = config.get('nodes', [])
+                        node_names = []
+                        for node in nodes:
+                            ssh_url = node.get('ssh_url', '')
+                            if ssh_url:
+                                # Extract hostname from ssh_url
+                                host = ssh_url.split(':')[0]
+                                node_names.append(host)
+                        if node_names:
+                            print(f"✅ Found nodes from etcd: {node_names}")
+                            return node_names
+                
+                print("⚠️  No running clusters or nodes found in etcd")
+            else:
+                print("⚠️  No etcd connection available")
+        except Exception as e:
+            print(f"❌ Failed to query etcd for nodes: {e}")
+        
+        # Fallback to default node
+        print("🔄 Using fallback node: default-node")
+        return ["default-node"]
+    
+    def _node_matches(self, node_name: str) -> bool:
+        """Check if node matches nodeSelector and nodeAffinity requirements"""
+        # For now, simplified matching based on nodeName
+        if self.node_selector:
+            # Check if nodeSelector specifies nodeName or nokube/nodeName
+            node_name_selector = self.node_selector.get('nodeName') or self.node_selector.get('nokube/nodeName')
+            if node_name_selector and node_name_selector != node_name:
+                return False
+        
+        # TODO: Implement more sophisticated nodeAffinity matching
+        # For now, assume all nodes are eligible unless explicitly excluded
+        return True
+
 
 @ray.remote
 class KubeControllerActor:
@@ -1157,7 +1465,9 @@ class KubeControllerActor:
             for i in range(replicas):
                 pod_name = f"{base_name}-pod-{i}-{_short_id()}"
                 pod_actor_name = f"pod-{_safe_name(ns)}-{_safe_name(base_name)}-{i}-{_short_id()}"
-                actor = PodActor.options(name=pod_actor_name).remote(pod_name, ns, containers, pod_actor_name)
+                # 从 Deployment 传递模板 volumes
+                volumes = tmpl_spec.get("volumes", []) or []
+                actor = PodActor.options(name=pod_actor_name).remote(pod_name, ns, containers, pod_actor_name, None, base_name, volumes)
                 self.pods[pod_name] = actor
                 started.append(actor.start.remote())
 
@@ -1170,11 +1480,91 @@ class KubeControllerActor:
             base_name = meta.get("name", "pod")
             pod_name = f"{base_name}-{_short_id()}"
             pod_actor_name = f"pod-{_safe_name(ns)}-{_safe_name(base_name)}-{_short_id()}"
-            actor = PodActor.options(name=pod_actor_name).remote(pod_name, ns, containers, pod_actor_name)
+            # 直接 Pod 资源也传递其 volumes
+            volumes = spec.get("volumes", []) or []
+            actor = PodActor.options(name=pod_actor_name).remote(pod_name, ns, containers, pod_actor_name, None, None, volumes)
             self.pods[pod_name] = actor
             started.append(actor.start.remote())
 
         results = ray.get(started) if started else []
+
+        # Ensure system config: one PodActor per node (best-effort), no user YAML required
+        try:
+            print("🔧 Starting system config ensure...")
+            etcd = _try_create_etcd()
+            node_names: List[str] = []
+            if etcd is not None:
+                print("✅ Etcd connection available")
+                try:
+                    clusters = etcd.list_clusters() or []
+                    print(f"📋 Found {len(clusters)} clusters")
+                    for c in clusters:
+                        cfg = (c or {}).get('config') or {}
+                        for n in (cfg.get('nodes') or []):
+                            nm = (n or {}).get('name')
+                            if nm and nm not in node_names:
+                                node_names.append(nm)
+                except Exception as e:
+                    print(f"⚠️  Failed to get nodes from etcd: {e}")
+            else:
+                print("⚠️  No etcd connection")
+            if not node_names:
+                node_names = ["default-node"]
+            print(f"🎯 Target nodes: {node_names}")
+
+            node_cfg_container = {
+                "name": "node-config",
+                "image": "python:3.10",
+                "securityContext": {"privileged": True},
+                "command": ["/bin/bash", "-lc"],
+                "args": [
+                    "echo CFG | node=$(hostname) http=$http_proxy https=$https_proxy no=$no_proxy; "
+                    "while true; do "
+                    "echo '[CONFIG]' $(date) 'proxy env:' http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy; "
+                    "sleep 300; "
+                    "done"
+                ],
+                "volumeMounts": [{"name": "docker-etc", "mountPath": "/host/etc/docker"}],
+            }
+            node_cfg_vols = [{"name": "docker-etc", "persistentVolumeClaim": {"localPath": "/etc/docker"}}]
+
+            from src.actor_utils import ensure_actor  # type: ignore
+            ns_sys = "nokube-system"
+            ds_name = "sys-nokube-node-config"
+            ray_ns = os.environ.get("NOKUBE_NAMESPACE", "nokube")
+            
+            # Create system config DaemonSet spec
+            ds_spec = {
+                "metadata": {"name": ds_name, "namespace": ns_sys},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [node_cfg_container],
+                            "volumes": node_cfg_vols
+                        }
+                    }
+                }
+            }
+            
+            # Create DaemonSetActor to manage system config
+            ds_actor_name = f"daemonset-{_safe_name(ns_sys)}-{_safe_name(ds_name)}"
+            ds_actor = ensure_actor(
+                DaemonSetActor,
+                ds_actor_name,
+                namespace=ray_ns,
+                detached=True,
+                replace_existing=True,
+                ctor_args=(ds_name, ns_sys, ds_spec),
+                stop_method="stop",
+                stop_timeout=10,
+            )
+            try:
+                ds_actor.start.remote()
+                print(f"✅ Started system config DaemonSet: {ds_actor_name}")
+            except Exception as e:
+                print(f"⚠️  Failed to start system config DaemonSet {ds_actor_name}: {e}")
+        except Exception:
+            pass
         return {
             "controller": self.name,
             "pods_started": len(results),

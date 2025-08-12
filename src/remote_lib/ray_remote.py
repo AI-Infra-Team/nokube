@@ -414,6 +414,49 @@ class RayRemoteManager:
             return False, "", "Command execution timeout"
         except Exception as e:
             return False, "", str(e)
+    
+    def ensure_system_config_daemonset(self) -> bool:
+        """Ensure system config DaemonSet in Ray cluster"""
+        try:
+            # Import necessary modules from project root
+            import sys
+            import os
+            
+            # Add project src to path so we can import from src.*
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
+            import ray
+            # Connect to local Ray cluster
+            ray.init(ignore_reinit_error=True, namespace="nokube")
+            
+            # Import controller classes
+            from src.ray_kube_controller import KubeControllerActor
+            from src.actor_utils import ensure_actor
+            
+            # Get or create KubeControllerActor
+            controller = ensure_actor(
+                KubeControllerActor,
+                "kube-controller", 
+                namespace="nokube",
+                detached=True,
+                replace_existing=False,
+                ctor_args=(),
+                stop_method="stop",
+                stop_timeout=10,
+            )
+            
+            # Call apply with empty resources to trigger system config DaemonSet ensure
+            ray.get(controller.apply.remote([]))
+            print("✅ System config DaemonSet ensured successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to ensure system config DaemonSet: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 
 def main() -> None:
@@ -459,6 +502,9 @@ def main() -> None:
     
     # _install_ray command (internal use)
     subparsers.add_parser("_install_ray", help="Install Ray")
+    
+    # ensure-system-config command
+    subparsers.add_parser("ensure-system-config", help="Ensure system config DaemonSet")
     
     args = parser.parse_args()
     
@@ -658,9 +704,18 @@ def main() -> None:
                 def run(self):
                     print(f"CFG | NodeConfigActor running on {self.node_name}, interval={self.interval}s")
                     while True:
-                        env=self._fetch()
+                        env = self._fetch()
+                        try:
+                            masked = ', '.join(_mask(env)) if env else '(empty)'
+                        except Exception:
+                            masked = '(unprintable)'
+                        print(f"CFG | current: {masked}")
                         if env:
-                            self._apply(env)
+                            if env != self.last_env:
+                                self._apply(env)
+                            else:
+                                print("CFG | no change")
+                        # no env -> just print current and sleep
                         time.sleep(self.interval)
 
             NS=os.environ.get('NOKUBE_NAMESPACE','nokube')
@@ -680,6 +735,11 @@ def main() -> None:
         except Exception as e:
             print(f"❌ failed to start-config-actor: {e}")
             sys.exit(1)
+    
+    elif args.command == "ensure-system-config":
+        # Ensure system config DaemonSet
+        success = manager.ensure_system_config_daemonset()
+        sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
