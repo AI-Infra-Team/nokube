@@ -50,38 +50,79 @@ def init_rich_console():
         return False
 
 
-def run_command(cmd, cwd=None, shell=True, check=True):
-    """执行系统命令"""
+def run_command(cmd, cwd=None, shell=True, check=True, show_progress=True, capture_output=False):
+    """执行系统命令
+    
+    Args:
+        cmd: 要执行的命令
+        cwd: 工作目录
+        shell: 是否使用shell
+        check: 是否检查返回码
+        show_progress: 是否显示实时输出进度（默认True），如果为True则不捕获输出
+        capture_output: 是否捕获输出（默认False），为True时会忽略show_progress
+    
+    Returns:
+        如果capture_output=True，返回subprocess.CompletedProcess对象
+        如果show_progress=True，返回None
+    """
     try:
         if console:
             console.print(f"[cyan]执行: {cmd}[/cyan]")
         else:
             print(f"执行: {cmd}")
+        
+        if capture_output:
+            # 捕获输出模式：适用于需要处理输出结果的场景
+            result = subprocess.run(
+                cmd, 
+                shell=shell, 
+                cwd=cwd, 
+                check=check,
+                capture_output=True, 
+                text=True
+            )
+            if result.stdout:
+                if console:
+                    console.print(f"[green]{result.stdout.strip()}[/green]")
+                else:
+                    print(result.stdout.strip())
+            return result
+        else:
+            # 实时输出模式：适用于长时间运行的命令，如安装、编译等
+            if show_progress:
+                if console:
+                    console.print(f"[yellow]⏳ 实时输出模式...[/yellow]")
+                else:
+                    print("⏳ 实时输出模式...")
             
-        result = subprocess.run(
-            cmd, 
-            shell=shell, 
-            cwd=cwd, 
-            check=check,
-            capture_output=True, 
-            text=True
-        )
-        if result.stdout:
-            if console:
-                console.print(f"[green]{result.stdout.strip()}[/green]")
-            else:
-                print(result.stdout.strip())
-        return result
+            result = subprocess.run(
+                cmd, 
+                shell=shell, 
+                cwd=cwd, 
+                check=check,
+                # 不捕获输出，直接显示到终端
+                capture_output=False,
+                text=True
+            )
+            
+            if show_progress:
+                if console:
+                    console.print(f"[green]✅ 命令执行完成[/green]")
+                else:
+                    print("✅ 命令执行完成")
+            
+            return None  # 实时输出模式不返回结果
+            
     except subprocess.CalledProcessError as e:
         if console:
-            console.print(f"[red]命令执行失败: {cmd}[/red]")
-            console.print(f"[red]错误: {e.stderr}[/red]")
+            console.print(f"[red]❌ 命令执行失败: {cmd}[/red]")
+            console.print(f"[red]错误码: {e.returncode}[/red]")
         else:
-            print(f"命令执行失败: {cmd}")
-            print(f"错误: {e.stderr}")
+            print(f"❌ 命令执行失败: {cmd}")
+            print(f"错误码: {e.returncode}")
         if check:
             raise
-        return e
+        return None
 
 
 def safe_print(message, style=None):
@@ -169,17 +210,27 @@ def install_python_deps():
     """安装Python依赖"""
     safe_print("🐍 安装 Python 依赖...", style="blue")
     
-    nokube_dir = Path("/opt/nokube")
-    if not nokube_dir.exists():
-        raise RuntimeError("nokube目录不存在，请先设置代码仓库")
+    # git-watcher 需要的第三方库
+    required_packages = [
+        "gitpython",      # Git 操作
+        "requests",       # HTTP 请求
+        "pyyaml",        # YAML 解析
+        "rich",          # 美化输出
+    ]
     
-    # 安装项目依赖
-    try:
-        run_command("pip install --no-cache-dir -e .", cwd=nokube_dir)
-        safe_print("✅ Python 依赖安装完成", style="green")
-    except Exception as e:
-        safe_print(f"❌ Python 依赖安装失败: {e}", style="red")
-        raise
+    python_executable = sys.executable
+    
+    # 逐个安装依赖包
+    for package in required_packages:
+        try:
+            safe_print(f"📦 安装 {package}...", style="cyan")
+            run_command(f"{python_executable} -m pip install --no-cache-dir {package}")
+            safe_print(f"✅ {package} 安装完成", style="green")
+        except Exception as e:
+            safe_print(f"❌ {package} 安装失败: {e}", style="red")
+            raise
+    
+    safe_print("✅ 所有 Python 依赖安装完成", style="green")
 
 
 def setup_directories():
@@ -281,7 +332,7 @@ def check_health():
     
     # 检查Python
     try:
-        result = run_command(f"{sys.executable} --version", check=False)
+        result = run_command(f"{sys.executable} --version", check=False, capture_output=True)
         if result.returncode == 0:
             checks.append(("Python", f"✅ {result.stdout.strip()}"))
         else:

@@ -734,9 +734,19 @@ class RemoteExecutor:
             if ray_args:
                 full_command += " " + " ".join(ray_args)
             
+            # 确保环境变量字典存在，并添加 Ray 内存阈值配置
+            if env is None:
+                env = {}
+            else:
+                env = env.copy()  # 避免修改原始字典
+            
+            # 设置 Ray 内存使用阈值为 99%，避免因内存不足导致 actors 被杀死
+            env['RAY_memory_usage_threshold'] = '0.99'
+            
             if realtime_output:
                 console.print(f"🚀 Executing Ray command with logging: {command}", style="blue")
                 console.print(f"📝 Auto-generated log file: {log_file}", style="yellow")
+                console.print(f"⚙️ Ray 内存阈值设置为 99%", style="cyan")
                 # 打印代理（脱敏）
                 if env:
                     masked = []
