@@ -319,6 +319,145 @@ class ContainerActor:
         self._proc: Optional[subprocess.Popen] = None
         self._io_thread: Optional[threading.Thread] = None
         self._stop_stream: bool = False
+        self._etcd = _try_create_etcd()  # 初始化 etcd 连接
+
+    def _get_pod_volumes(self) -> List[Dict[str, Any]]:
+        """从 etcd 查询当前 pod 的 volumes 配置"""
+        if not self._etcd:
+            _log(f"CTR {self.actor_name}", "etcd 连接不可用，无法查询 volumes 配置")
+            return []
+        
+        try:
+            # 优先尝试从 deployment 的 spec 中获取 volumes 配置
+            if self.parent_deployment != "standalone":
+                deploy_spec_key = f"/nokube/deployments/{self.namespace}/{self.parent_deployment}/spec"
+                _log(f"CTR {self.actor_name}", f"查询 deployment spec: {deploy_spec_key}")
+                deploy_spec = self._etcd.get_kv(deploy_spec_key) or {}
+                _log(f"CTR {self.actor_name}", f"deployment spec 数据: {json.dumps(deploy_spec, ensure_ascii=False)}")
+                volumes = deploy_spec.get("volumes", [])
+                if volumes:
+                    _log(f"CTR {self.actor_name}", f"从 deployment spec 获取到 {len(volumes)} 个 volumes")
+                    return volumes
+                else:
+                    _log(f"CTR {self.actor_name}", f"deployment spec 中未找到 volumes 配置")
+            
+            # 如果没有找到，尝试直接查询 pod 配置（适用于独立 pod）
+            pod_key = f"/nokube/pods/{self.namespace}/{self.pod_name}/spec"
+            _log(f"CTR {self.actor_name}", f"查询 pod spec: {pod_key}")
+            pod_config = self._etcd.get_kv(pod_key) or {}
+            volumes = pod_config.get("volumes", [])
+            if volumes:
+                _log(f"CTR {self.actor_name}", f"从 pod spec 获取到 {len(volumes)} 个 volumes")
+            else:
+                _log(f"CTR {self.actor_name}", f"pod spec 中未找到 volumes 配置")
+            return volumes
+            
+        except Exception as e:
+            _log(f"CTR {self.actor_name}", f"查询 volumes 配置时出错: {e}")
+            return []
+
+    def _ensure_container_volumes(self, pod_volumes: List[Dict[str, Any]], volume_mounts: List[Dict[str, Any]]):
+        """为当前容器物化需要的 volumes 数据（Secret/ConfigMap）"""
+        _log(f"CTR {self.actor_name}", f"🔧 开始物化容器 volumes，pod_volumes={len(pod_volumes)}, volume_mounts={len(volume_mounts)}")
+        if not self._etcd:
+            _log(f"CTR {self.actor_name}", "etcd 连接不可用，无法物化 volumes")
+            return
+        
+        # 创建 volume name 到 volume 定义的映射
+        volume_by_name = {v.get("name"): v for v in pod_volumes if v.get("name")}
+        
+        # 获取当前容器需要的 volume names
+        needed_volumes = {m.get("name") for m in volume_mounts if m.get("name")}
+        
+        _log(f"CTR {self.actor_name}", f"容器需要物化的 volumes: {list(needed_volumes)}")
+        
+        base = f"/var/lib/nokube/volumes/{self.full_path(include_container=False, include_namespace=True)}"
+        os.makedirs(base, exist_ok=True)
+        
+        for vname in needed_volumes:
+            volume_def = volume_by_name.get(vname)
+            if not volume_def:
+                continue
+                
+            target = os.path.join(base, _safe_name(vname))
+            
+            # 处理 ConfigMap
+            if volume_def.get("configMap"):
+                cm_name = volume_def.get("configMap", {}).get("name")
+                if cm_name:
+                    config_key = f"/nokube/configmaps/{self.namespace}/{cm_name}"
+                    _log(f"CTR {self.actor_name}", f"物化 ConfigMap: {config_key}")
+                    data = self._etcd.get_kv(config_key) or {}
+                    self._write_volume_files(target, data, f"ConfigMap '{cm_name}'")
+            
+            # 处理 Secret
+            elif volume_def.get("secret"):
+                sec_name = volume_def.get("secret", {}).get("secretName")
+                if sec_name:
+                    secret_key = f"/nokube/secrets/{self.namespace}/{sec_name}"
+                    _log(f"CTR {self.actor_name}", f"物化 Secret: {secret_key}")
+                    data = self._etcd.get_kv(secret_key) or {}
+                    _log(f"CTR {self.actor_name}", f"Secret 数据: {json.dumps(data, ensure_ascii=False) if data else '空'}")
+                    self._write_volume_files(target, data, f"Secret '{sec_name}'")
+            
+            # 处理 HostPath
+            elif volume_def.get("hostPath"):
+                host_path = volume_def.get("hostPath", {}).get("path")
+                if host_path:
+                    try:
+                        os.makedirs(host_path, exist_ok=True)
+                        _log(f"CTR {self.actor_name}", f"创建 HostPath: {host_path}")
+                    except Exception as e:
+                        _log(f"CTR {self.actor_name}", f"创建 HostPath 失败: {e}")
+
+    def _write_volume_files(self, target_dir: str, data: Dict[str, Any], volume_desc: str):
+        """将数据写入 volume 目录"""
+        try:
+            import subprocess
+            import os
+            current_user = os.getenv("USER", "root")
+            
+            # 确保目录存在并设置正确权限和所有权
+            try:
+                # 创建目录
+                subprocess.run(["sudo", "mkdir", "-p", target_dir], check=True, capture_output=True)
+                # 将目录所有权设置为当前用户（这样当前用户就有写权限了）
+                subprocess.run(["sudo", "chown", f"{current_user}:{current_user}", target_dir], check=True, capture_output=True)
+                # 设置目录权限，让当前用户和容器都能访问
+                subprocess.run(["sudo", "chmod", "755", target_dir], check=True, capture_output=True)
+                _log(f"CTR {self.actor_name}", f"创建目录并设置权限: {target_dir} (owner: {current_user})")
+            except subprocess.CalledProcessError as e:
+                _log(f"CTR {self.actor_name}", f"创建目录失败: {e}")
+                # 尝试普通创建
+                os.makedirs(target_dir, exist_ok=True)
+            
+            file_count = 0
+            for key, value in data.items():
+                try:
+                    file_path = os.path.join(target_dir, key)
+                    
+                    # 先删除旧文件（如果存在）
+                    try:
+                        subprocess.run(["sudo", "rm", "-f", file_path], check=True, capture_output=True)
+                        _log(f"CTR {self.actor_name}", f"删除旧文件: {file_path}")
+                    except subprocess.CalledProcessError:
+                        pass  # 文件可能不存在，忽略错误
+                    
+                    # 创建新文件
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(str(value))
+                    
+                    # 设置文件权限为可读写
+                    os.chmod(file_path, 0o644)
+                    
+                    file_count += 1
+                    _log(f"CTR {self.actor_name}", f"创建文件: {file_path} (644)")
+                except Exception as e:
+                    _log(f"CTR {self.actor_name}", f"创建文件失败 {key}: {e}")
+            
+            _log(f"CTR {self.actor_name}", f"✅ {volume_desc} 物化完成: {file_count} 个文件 -> {target_dir}")
+        except Exception as e:
+            _log(f"CTR {self.actor_name}", f"❌ {volume_desc} 物化失败: {e}")
 
     def full_path(self, include_container: bool = False, include_namespace: bool = True) -> str:
         """返回容器/Pod 的稳定路径段：namespace/workload/pod[/container]
@@ -336,6 +475,8 @@ class ContainerActor:
         return "/".join(parts)
 
     def start(self, attempts: int = 5, backoff_seconds: float = 3.0, stream_logs: bool = True) -> Dict[str, Any]:
+        # 版本标识
+        _log(f"CTR {self.actor_name}", "🚀 ContainerActor v2.1 - 修复权限处理")
         # 开头打印当前进程可见的代理环境摘要
         try:
             proxy_items = _mask_proxy_items(os.environ)
@@ -377,8 +518,28 @@ class ContainerActor:
 
         def _build_volume_args() -> List[str]:
             vol_args: List[str] = []
+            mount_info: List[str] = []  # 收集挂载信息用于打印
+            special_mount_info: List[str] = []  # 收集特殊挂载信息
+            
+            # 从 etcd 获取 pod 的 volumes 配置
+            pod_volumes = self._get_pod_volumes()
+            
+            # 打印 pod volumes 信息用于调试
+            if pod_volumes:
+                _log(f"CTR {self.actor_name}", f"Pod volumes 配置: {json.dumps(pod_volumes, ensure_ascii=False)}")
+            else:
+                _log(f"CTR {self.actor_name}", "未找到 Pod volumes 配置")
+            
+            volume_by_name = {v.get("name"): v for v in pod_volumes if v.get("name")}
+            
             # 将 K8s 风格 volumeMounts 映射到 docker -v host:container
             mounts = self.container.get("volumeMounts", []) or []
+            if mounts:
+                _log(f"CTR {self.actor_name}", f"容器 volumeMounts 配置: {json.dumps(mounts, ensure_ascii=False)}")
+            
+            # 物化特殊挂载类型的数据
+            self._ensure_container_volumes(pod_volumes, mounts)
+            
             # 以 namespace/workload/pod 解析到宿主路径，并为每个容器形成唯一 mount 点
             base = f"/var/lib/nokube/volumes/{self.full_path(include_container=False, include_namespace=True)}"
             for m in mounts:
@@ -394,6 +555,42 @@ class ContainerActor:
                     pass
                 host_dir = pod_vol_dir
                 vol_args.extend(["-v", f"{host_dir}:{mpath}"])
+                
+                # 检查挂载类型
+                volume_def = volume_by_name.get(vname)
+                if volume_def:
+                    _log(f"CTR {self.actor_name}", f"卷 '{vname}' 的定义: {json.dumps(volume_def, ensure_ascii=False)}")
+                    if volume_def.get("configMap"):
+                        cm_name = volume_def.get("configMap", {}).get("name", "unknown")
+                        special_mount_info.append(f"ConfigMap '{cm_name}': {host_dir} -> {mpath}")
+                    elif volume_def.get("secret"):
+                        sec_name = volume_def.get("secret", {}).get("secretName", "unknown")
+                        special_mount_info.append(f"Secret '{sec_name}': {host_dir} -> {mpath}")
+                    elif volume_def.get("hostPath"):
+                        host_path = volume_def.get("hostPath", {}).get("path", "unknown")
+                        special_mount_info.append(f"HostPath '{host_path}': {host_dir} -> {mpath}")
+                    elif volume_def.get("persistentVolumeClaim"):
+                        pvc_name = volume_def.get("persistentVolumeClaim", {}).get("claimName", "unknown")
+                        local_path = volume_def.get("persistentVolumeClaim", {}).get("localPath", "")
+                        if local_path:
+                            special_mount_info.append(f"PVC '{pvc_name}' (localPath: {local_path}): {host_dir} -> {mpath}")
+                        else:
+                            special_mount_info.append(f"PVC '{pvc_name}': {host_dir} -> {mpath}")
+                    else:
+                        mount_info.append(f"{host_dir} -> {mpath}")
+                else:
+                    _log(f"CTR {self.actor_name}", f"警告: 未找到卷定义 '{vname}'，使用普通挂载")
+                    mount_info.append(f"{host_dir} -> {mpath}")
+            
+            # 打印普通挂载信息
+            if mount_info:
+                _log(f"CTR {self.actor_name}", f"挂载卷: {', '.join(mount_info)}")
+            
+            # 打印特殊挂载信息
+            if special_mount_info:
+                for special_mount in special_mount_info:
+                    _log(f"CTR {self.actor_name}", f"特殊挂载: {special_mount}")
+            
             return vol_args
 
         def _build_final_cmd() -> List[str]:
@@ -878,9 +1075,12 @@ class PodActor:
           写入到 /var/lib/nokube/volumes/<ns>/<deploy>/<pod>/<volName>/ 下（pod 级唯一）。
         - 支持 hostPath 直透（确保目录存在）。
         """
+        _log(f"POD {self.actor_name}", f"开始物化 {len(volumes)} 个 volumes")
         try:
             base = f"/var/lib/nokube/volumes/{self.full_path(include_namespace=True)}"
             os.makedirs(base, exist_ok=True)
+            special_mounts: List[str] = []  # 收集特殊挂载信息用于打印
+            
             for v in volumes or []:
                 vname = v.get("name")
                 if not vname:
@@ -889,38 +1089,57 @@ class PodActor:
                     continue
                 target = os.path.join(base, _safe_name(vname))
                 src: Dict[str, Any] = v or {}
+                
                 if src.get("configMap") and self._etcd is not None:
                     cm_name = (src.get("configMap") or {}).get("name")
                     if cm_name:
                         data = self._etcd.get_kv(f"/nokube/configmaps/{self.namespace}/{cm_name}") or {}
                         os.makedirs(target, exist_ok=True)
+                        file_count = 0
                         for k, val in (data or {}).items():
                             try:
                                 with open(os.path.join(target, k), 'w', encoding='utf-8') as f:
                                     f.write(str(val))
+                                file_count += 1
                             except Exception:
                                 pass
                         self._materialized_volumes[vname] = True
+                        special_mounts.append(f"ConfigMap '{cm_name}' ({file_count} 文件) -> {target}")
+                        
                 elif src.get("secret") and self._etcd is not None:
-                    sec_name = (src.get("secret") or {}).get("name")
+                    sec_name = (src.get("secret") or {}).get("secretName")
                     if sec_name:
-                        data = self._etcd.get_kv(f"/nokube/secrets/{self.namespace}/{sec_name}") or {}
+                        secret_key = f"/nokube/secrets/{self.namespace}/{sec_name}"
+                        _log(f"POD {self.actor_name}", f"查询 Secret: {secret_key}")
+                        data = self._etcd.get_kv(secret_key) or {}
+                        _log(f"POD {self.actor_name}", f"Secret 数据: {json.dumps(data, ensure_ascii=False) if data else '空'}")
                         os.makedirs(target, exist_ok=True)
+                        file_count = 0
                         for k, val in (data or {}).items():
                             try:
                                 with open(os.path.join(target, k), 'w', encoding='utf-8') as f:
                                     f.write(str(val))
+                                file_count += 1
                             except Exception:
                                 pass
                         self._materialized_volumes[vname] = True
+                        special_mounts.append(f"Secret '{sec_name}' ({file_count} 文件) -> {target}")
+                        
                 elif src.get("hostPath"):
                     host_path = (src.get("hostPath") or {}).get("path")
                     if host_path:
                         try:
                             os.makedirs(host_path, exist_ok=True)
                             self._materialized_volumes[vname] = True
+                            special_mounts.append(f"HostPath '{host_path}' -> {target}")
                         except Exception:
                             pass
+            
+            # 打印特殊挂载信息
+            if special_mounts:
+                for mount in special_mounts:
+                    _log(f"POD {self.actor_name}", f"特殊挂载: {mount}")
+                    
         except Exception:
             pass
 
@@ -971,12 +1190,19 @@ class PodActor:
 class DeploymentActor:
     """Deployment 级 Actor：管理 Pod 子 Actor。"""
 
-    def __init__(self, name: str, namespace: str, replicas: int, containers: List[Dict[str, Any]], volumes: Optional[List[Dict[str, Any]]] = None):
+    def __init__(self, name: str, namespace: str, spec: Dict[str, Any]):
         self.name = name
         self.namespace = namespace
-        self.replicas = replicas
-        self.containers = containers
-        self.volumes = volumes or []
+        # 从完整的 spec 中解析各个字段
+        self.replicas = spec.get('replicas', 1)
+        tmpl_spec = spec.get('template', {}).get('spec', {})
+        self.containers = tmpl_spec.get('containers', [])
+        self.volumes = tmpl_spec.get('volumes', [])
+        
+        # 调试信息：确认解析结果
+        _log(f"DEP {self.name}", f"从 spec 解析: replicas={self.replicas}, containers={len(self.containers)}, volumes={len(self.volumes)}")
+        if self.volumes:
+            _log(f"DEP {self.name}", f"解析到的 volumes: {json.dumps(self.volumes, ensure_ascii=False)}")
         self.pods: Dict[str, Any] = {}
         self._stop_flag = False
         self._thread: Optional[threading.Thread] = None
@@ -1221,9 +1447,12 @@ class DeploymentActor:
             try:
                 # 添加 apply 时间戳，作为变更标识
                 applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                payload = {"generation": self._generation, "applied_at": applied_at, "containers": self.containers, "volumes": getattr(self, 'volumes', [])}
+                volumes_data = getattr(self, 'volumes', [])
+                payload = {"generation": self._generation, "applied_at": applied_at, "containers": self.containers, "volumes": volumes_data}
                 self._etcd.set_kv(self.spec_key, payload)
-                _log(f"DEP {self.name}", f"publish spec gen={self._generation} replicas={self.replicas} containers={len(self.containers)} applied_at={applied_at}")
+                _log(f"DEP {self.name}", f"publish spec gen={self._generation} replicas={self.replicas} containers={len(self.containers)} volumes={len(volumes_data)} applied_at={applied_at}")
+                if volumes_data:
+                    _log(f"DEP {self.name}", f"存储 volumes 配置: {json.dumps(volumes_data, ensure_ascii=False)}")
             except Exception:
                 pass
 
@@ -1245,6 +1474,14 @@ class DaemonSetActor:
         self.volumes = template_spec.get("volumes", [])
         self.node_selector = template_spec.get("nodeSelector", {})
         self.node_affinity = template_spec.get("affinity", {}).get("nodeAffinity", {})
+        
+        # 调试信息：打印解析的配置
+        _log(f"DEP {self.name}", f"解析 template spec: containers={len(self.containers)}, volumes={len(self.volumes)}")
+        if self.volumes:
+            _log(f"DEP {self.name}", f"解析到的 volumes: {json.dumps(self.volumes, ensure_ascii=False)}")
+        else:
+            _log(f"DEP {self.name}", f"template_spec 数据: {json.dumps(template_spec, ensure_ascii=False)}")
+            _log(f"DEP {self.name}", f"完整 spec 数据: {json.dumps(spec, ensure_ascii=False)}")
         
         # Initialize etcd connection
         try:

@@ -86,9 +86,11 @@ class Deployer:
             except Exception:
                 pass
 
-            # 从 K8s 文档中提取 Deployments 和 Pods
+            # 从 K8s 文档中提取 Deployments、Pods、Secrets 和 ConfigMaps
             deployments = [d for d in documents if isinstance(d, dict) and d.get('kind') == 'Deployment']
             pods = [d for d in documents if isinstance(d, dict) and d.get('kind') == 'Pod']
+            secrets = [d for d in documents if isinstance(d, dict) and d.get('kind') == 'Secret']
+            configmaps = [d for d in documents if isinstance(d, dict) and d.get('kind') == 'ConfigMap']
 
             futures = []
             for d in deployments:
@@ -110,7 +112,7 @@ class Deployer:
                     namespace="nokube",
                     detached=True,
                     replace_existing=True,
-                    ctor_args=(name, ns, replicas, containers),
+                    ctor_args=(name, ns, spec),  # 传递完整的 spec 而不是解析后的字段
                     stop_method="stop",
                     stop_timeout=10,
                 )
@@ -128,6 +130,42 @@ class Deployer:
                 containers = spec.get('containers', [])
                 actor = PodActor.options(name=None).remote(name, ns, containers)
                 futures.append(actor.start.remote())
+
+            # 处理 Secret 和 ConfigMap（存储到 etcd）
+            try:
+                from src.etcd_manager import EtcdManager
+                etcd = EtcdManager()
+                
+                # 存储 ConfigMaps
+                for cm in configmaps:
+                    meta = cm.get("metadata", {})
+                    ns = meta.get("namespace", "default")
+                    name = meta.get("name", "")
+                    if name:
+                        data = cm.get("data", {})
+                        # 处理 stringData 字段
+                        string_data = cm.get("stringData", {})
+                        data.update(string_data)
+                        
+                        etcd.set_kv(f"/nokube/configmaps/{ns}/{name}", data)
+                        console.print(f"✅ 存储 ConfigMap: {ns}/{name} ({len(data)} 项)", style="green")
+                
+                # 存储 Secrets
+                for sec in secrets:
+                    meta = sec.get("metadata", {})
+                    ns = meta.get("namespace", "default")
+                    name = meta.get("name", "")
+                    if name:
+                        data = sec.get("data", {})
+                        # 处理 stringData 字段
+                        string_data = sec.get("stringData", {})
+                        data.update(string_data)
+                        
+                        etcd.set_kv(f"/nokube/secrets/{ns}/{name}", data)
+                        console.print(f"✅ 存储 Secret: {ns}/{name} ({len(data)} 项)", style="green")
+                        
+            except Exception as e:
+                console.print(f"⚠️ 存储 ConfigMap/Secret 时出错: {e}", style="yellow")
 
             # 避免长时间阻塞：仅等待最先完成的 start，然后尽快返回
             results = []
