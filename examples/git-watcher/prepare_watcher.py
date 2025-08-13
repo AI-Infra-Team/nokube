@@ -88,18 +88,26 @@ def setup_nokube_repo():
     if nokube_dir.exists():
         console.print("🔄 更新现有仓库...")
         try:
+            # 检查网络连接和代理设置
+            console.print("🌐 检查网络连接...")
+            proxy_vars = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]
+            active_proxies = [f"{k}={os.environ[k]}" for k in proxy_vars if k in os.environ]
+            if active_proxies:
+                console.print(f"🔗 使用代理: {', '.join(active_proxies)}")
+            else:
+                console.print("🔗 未设置代理")
+            
             run_command("git pull", cwd=nokube_dir, check=False)
             console.print("✅ 仓库更新完成", style="green")
         except Exception as e:
             console.print(f"⚠️ 仓库更新失败，继续使用现有代码: {e}", style="yellow")
     else:
         console.print("📦 克隆新仓库...")
-        try:
-            run_command(f"git clone {repo_url} {nokube_dir}")
-            console.print("✅ 仓库克隆完成", style="green")
-        except Exception as e:
-            console.print(f"❌ 仓库克隆失败: {e}", style="red")
-            raise
+        console.print("⚠️ 代码仓库应该在容器启动脚本中克隆", style="yellow")
+        console.print("如果看到此消息，说明启动脚本可能有问题", style="yellow")
+        # 这里不再尝试克隆，因为应该在启动脚本中完成
+        if not nokube_dir.exists():
+            raise RuntimeError("nokube代码目录不存在，请检查容器启动脚本")
 
 
 def install_python_deps():

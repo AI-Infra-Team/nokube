@@ -613,6 +613,16 @@ class ContainerActor:
             final_cmd = _build_final_cmd()
 
             run_args: List[str] = _sudo_prefix() + ["docker", "run", "--rm", "--name", self.container_name]
+            # 确保Python输出不被缓冲
+            run_args.extend(["-e", "PYTHONUNBUFFERED=1"])
+            
+            # 传入代理环境变量到容器内
+            proxy_vars = ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
+            for proxy_var in proxy_vars:
+                if proxy_var in os.environ:
+                    _log(f"CTR {self.actor_name}", f"container appended with proxy env: {proxy_var}={os.environ[proxy_var]}")
+                    run_args.extend(["-e", f"{proxy_var}={os.environ[proxy_var]}"])
+            
             for k, v in env_dict.items():
                 run_args.extend(["-e", f"{k}={v}"])
             run_args.extend(port_args)
@@ -628,7 +638,7 @@ class ContainerActor:
 
             # 确保 no_proxy 至少包含本地常见地址，避免代理环路
             try:
-                default_no_proxy = "localhost,127.0.0.1,::1"
+                default_no_proxy = "localhost,127.0.0.1,::1,192.168.0.0/16"
                 existing = proc_env.get('no_proxy') or proc_env.get('NO_PROXY') or ''
                 if default_no_proxy not in existing:
                     merged = ','.join([p for p in [existing, default_no_proxy] if p])

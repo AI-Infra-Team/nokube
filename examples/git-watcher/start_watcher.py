@@ -11,6 +11,10 @@ import signal
 import time
 from pathlib import Path
 
+# 确保输出不被缓冲
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root / 'src'))

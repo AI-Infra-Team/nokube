@@ -82,6 +82,8 @@ class Deployer:
                     ignore_reinit_error=True,
                     runtime_env={"working_dir": str(project_root)},
                     namespace="nokube",
+                    log_to_stdout=True,  # 确保Ray日志输出到stdout
+                    _temp_logs_disabled=False,  # 启用临时日志
                 )
             except Exception:
                 pass
