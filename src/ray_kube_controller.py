@@ -320,6 +320,172 @@ class ContainerActor:
         self._io_thread: Optional[threading.Thread] = None
         self._stop_stream: bool = False
         self._etcd = _try_create_etcd()  # 初始化 etcd 连接
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._should_stop: bool = False
+
+    def _start_container_monitor(self):
+        """启动容器监控线程，等待容器完成并重启"""
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+            
+        self._should_stop = False
+        self._monitor_thread = threading.Thread(target=self._monitor_container_lifecycle, daemon=True)
+        self._monitor_thread.start()
+        _log(f"CTR {self.actor_name}", "启动容器生命周期监控线程")
+
+    def _monitor_container_lifecycle(self):
+        """监控容器生命周期的主循环"""
+        restart_count = 0
+        while not self._should_stop:
+            try:
+                if self._proc is None:
+                    time.sleep(1)
+                    continue
+                
+                # 等待当前容器进程完成
+                exit_code = self._proc.wait()
+                restart_count += 1
+                
+                if exit_code == 0:
+                    _log(f"CTR {self.actor_name}", f"🎉 容器正常完成 (第 {restart_count} 次运行)")
+                else:
+                    _log(f"CTR {self.actor_name}", f"⚠️ 容器异常退出 exit_code={exit_code} (第 {restart_count} 次运行)")
+                
+                # 停止 IO 线程
+                self._stop_stream = True
+                if self._io_thread and self._io_thread.is_alive():
+                    self._io_thread.join(timeout=1)
+                
+                # 如果没有被要求停止，则重启容器
+                if not self._should_stop:
+                    _log(f"CTR {self.actor_name}", f"🔄 准备重启容器 (等待 3 秒)...")
+                    time.sleep(3)  # 稍等一下再重启
+                    
+                    if not self._should_stop:
+                        self._restart_container()
+                
+            except Exception as e:
+                _log(f"CTR {self.actor_name}", f"❌ 容器监控出错: {e}")
+                if not self._should_stop:
+                    time.sleep(5)  # 出错后等待更长时间
+
+    def _restart_container(self):
+        """重启容器"""
+        try:
+            _log(f"CTR {self.actor_name}", "🔄 重启容器...")
+            
+            # 重新执行启动逻辑（但不重新设置监控）
+            image = (self.container.get("image") or "").strip()
+            if not image:
+                _log(f"CTR {self.actor_name}", "❌ 重启失败：镜像名称为空")
+                return
+                
+            # 重新构建启动参数
+            env_dict = self._build_env_dict()
+            port_args = self._build_ports_list()
+            volume_args = self._build_volume_args()
+            final_cmd = self._build_final_cmd()
+            
+            # 重新物化 volumes（如果需要）
+            pod_volumes = self._get_pod_volumes()
+            mounts = self.container.get("volumeMounts", []) or []
+            self._ensure_container_volumes(pod_volumes, mounts)
+            
+            # 构建 docker run 命令
+            sudo_prefix = [] if os.geteuid() == 0 else ["sudo", "-E", "-n"]
+            run_args = sudo_prefix + ["docker", "run", "--rm", "--name", self.container_name]
+            
+            # 添加环境变量
+            run_args.extend(["-e", "PYTHONUNBUFFERED=1"])
+            proxy_vars = ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
+            for proxy_var in proxy_vars:
+                if proxy_var in os.environ:
+                    run_args.extend(["-e", f"{proxy_var}={os.environ[proxy_var]}"])
+            
+            for k, v in env_dict.items():
+                run_args.extend(["-e", f"{k}={v}"])
+            run_args.extend(port_args)
+            run_args.extend(volume_args)
+            run_args.append(image)
+            run_args.extend(final_cmd)
+            
+            # 删除旧容器
+            try:
+                subprocess.run(sudo_prefix + ["docker", "rm", "-f", self.container_name], 
+                             capture_output=True, text=True)
+            except Exception:
+                pass
+            
+            # 启动新容器
+            self._proc = subprocess.Popen(
+                run_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            
+            # 重新启动 IO 线程
+            self._stop_stream = False
+            self._io_thread = threading.Thread(target=self._pump_output, daemon=True)
+            self._io_thread.start()
+            
+            _log(f"CTR {self.actor_name}", "✅ 容器重启成功")
+            
+        except Exception as e:
+            _log(f"CTR {self.actor_name}", f"❌ 容器重启失败: {e}")
+
+    def _pump_output(self):
+        """输出泵线程"""
+        try:
+            if self._proc and self._proc.stdout is not None:
+                for line in self._proc.stdout:
+                    if self._stop_stream:
+                        break
+                    try:
+                        _log(f"CTR {self.actor_name}", f"{line.rstrip()}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _build_env_dict(self) -> Dict[str, str]:
+        """构建环境变量字典"""
+        env_dict: Dict[str, str] = {}
+        for env in self.container.get("env", []) or []:
+            name = env.get("name")
+            value = env.get("value")
+            if name is not None and value is not None:
+                env_dict[name] = value
+        # 合并来自集群元数据的节点代理环境
+        try:
+            proxy_env = _resolve_node_proxy_env()
+            if proxy_env:
+                env_dict.update(proxy_env)
+        except Exception:
+            pass
+        return env_dict
+
+    def _build_ports_list(self) -> List[str]:
+        """构建端口映射列表"""
+        port_args: List[str] = []
+        for p in self.container.get("ports", []) or []:
+            cport = p.get("containerPort")
+            proto = (p.get("protocol") or "tcp").lower()
+            if cport:
+                # 使用随机宿主端口发布容器端口
+                port_val = f"{cport}/{proto}" if proto in ("tcp", "udp") else str(cport)
+                port_args.extend(["-p", port_val])
+        return port_args
+
+    def _build_final_cmd(self) -> List[str]:
+        """构建最终命令"""
+        cmd = self.container.get("command") or []
+        args = self.container.get("args") or []
+        if isinstance(cmd, list):
+            return cmd + (args if isinstance(args, list) else [])
+        # 非列表命令，直接忽略 args 以避免歧义
+        return cmd if cmd else []
 
     def _get_pod_volumes(self) -> List[Dict[str, Any]]:
         """从 etcd 查询当前 pod 的 volumes 配置"""
@@ -701,6 +867,11 @@ class ContainerActor:
                 raise RuntimeError(f"docker run exited: code={self._proc.returncode}")
 
             self.status = "Running"
+            _log(f"CTR {self.actor_name}", f"容器启动成功，开始监控容器生命周期")
+            
+            # 启动监控线程，等待容器完成并循环重启
+            self._start_container_monitor()
+            
             return {
                     "pod": self.pod_name,
                     "namespace": self.namespace,
@@ -751,7 +922,18 @@ class ContainerActor:
         }
 
     def stop(self) -> str:
+        import traceback
         try:
+            # 记录调用堆栈，查看谁调用了 stop
+            stack = ''.join(traceback.format_stack()[-3:-1])  # 获取调用者信息
+            _log(f"CTR {self.actor_name}", f"🛑 容器被要求停止，调用者: {stack.strip()}")
+            
+            # 停止监控线程
+            self._should_stop = True
+            if self._monitor_thread and self._monitor_thread.is_alive():
+                _log(f"CTR {self.actor_name}", "停止容器监控线程...")
+                self._monitor_thread.join(timeout=3)
+            
             # 停止输出线程
             try:
                 self._stop_stream = True
@@ -892,8 +1074,10 @@ class PodActor:
                 else:
                     # 旧实例已不在，尝试清理
                     try:
+                        _log(f"POD {self.actor_name}", f"🗑️ 清理失效的容器 actor: {c_name}")
                         existing.stop.remote()
-                    except Exception:
+                    except Exception as e:
+                        _log(f"POD {self.actor_name}", f"清理失效容器失败 {c_name}: {e}")
                         pass
                     try:
                         # 从记录中移除
@@ -1165,14 +1349,19 @@ class PodActor:
                 to_stop_names.append(name)
             else:
                 d = desired_by_name[name]
-                if any([
-                    cstat.get("image") != d.get("image"),
-                    (cstat.get("status") != "Running"),
-                ]):
+                restart_reasons = []
+                if cstat.get("image") != d.get("image"):
+                    restart_reasons.append(f"镜像变更: {cstat.get('image')} -> {d.get('image')}")
+                if cstat.get("status") != "Running":
+                    restart_reasons.append(f"状态异常: {cstat.get('status')} (期望: Running)")
+                
+                if restart_reasons:
+                    _log(f"POD {self.actor_name}", f"容器 {name} 需要重启，原因: {', '.join(restart_reasons)}")
                     to_stop_names.append(name)
 
         if to_stop_names:
             # 精确按容器名停止旧实例
+            _log(f"POD {self.actor_name}", f"🔄 配置变更，需要重启容器: {to_stop_names}")
             actors_to_stop: List[Any] = []
             for n in to_stop_names:
                 actor = self._actor_by_container.get(n)
@@ -1180,8 +1369,11 @@ class PodActor:
                     actors_to_stop.append(actor)
             if actors_to_stop:
                 try:
+                    _log(f"POD {self.actor_name}", f"停止 {len(actors_to_stop)} 个容器 actor 以应用新配置")
                     ray.get([a.stop.remote() for a in actors_to_stop], timeout=5)
-                except Exception:
+                    _log(f"POD {self.actor_name}", f"✅ 成功停止旧容器 actors")
+                except Exception as e:
+                    _log(f"POD {self.actor_name}", f"停止旧容器失败: {e}")
                     pass
             # 从记录中移除这些容器
             for n in to_stop_names:

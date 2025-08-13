@@ -10,17 +10,54 @@ import subprocess
 import shutil
 import tempfile
 from pathlib import Path
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
-console = Console()
+# 全局变量，稍后初始化
+console = None
+
+
+def install_basic_python_deps():
+    """安装基础Python依赖（在导入rich之前）"""
+    print("📦 安装基础 Python 依赖...")
+    
+    basic_deps = ['rich', 'pyyaml', 'requests']
+    
+    for dep in basic_deps:
+        try:
+            print(f"安装 {dep}...")
+            result = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '--no-cache-dir', dep],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"✅ {dep} 安装成功")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ {dep} 安装失败: {e}")
+            print(f"错误输出: {e.stderr}")
+            # 继续尝试安装其他包
+            continue
+
+
+def init_rich_console():
+    """初始化rich console"""
+    global console
+    try:
+        from rich.console import Console
+        console = Console()
+        return True
+    except ImportError:
+        print("❌ 无法导入 rich，请检查安装")
+        return False
 
 
 def run_command(cmd, cwd=None, shell=True, check=True):
     """执行系统命令"""
     try:
-        console.print(f"[cyan]执行: {cmd}[/cyan]")
+        if console:
+            console.print(f"[cyan]执行: {cmd}[/cyan]")
+        else:
+            print(f"执行: {cmd}")
+            
         result = subprocess.run(
             cmd, 
             shell=shell, 
@@ -30,19 +67,37 @@ def run_command(cmd, cwd=None, shell=True, check=True):
             text=True
         )
         if result.stdout:
-            console.print(f"[green]{result.stdout.strip()}[/green]")
+            if console:
+                console.print(f"[green]{result.stdout.strip()}[/green]")
+            else:
+                print(result.stdout.strip())
         return result
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]命令执行失败: {cmd}[/red]")
-        console.print(f"[red]错误: {e.stderr}[/red]")
+        if console:
+            console.print(f"[red]命令执行失败: {cmd}[/red]")
+            console.print(f"[red]错误: {e.stderr}[/red]")
+        else:
+            print(f"命令执行失败: {cmd}")
+            print(f"错误: {e.stderr}")
         if check:
             raise
         return e
 
 
+def safe_print(message, style=None):
+    """安全打印函数，自动选择console或print"""
+    if console:
+        if style:
+            console.print(message, style=style)
+        else:
+            console.print(message)
+    else:
+        print(message)
+
+
 def install_system_deps():
     """安装系统依赖"""
-    console.print("📦 安装系统依赖...", style="blue")
+    safe_print("📦 安装系统依赖...", style="blue")
     
     # 检查是否已安装
     deps_to_install = []
@@ -57,7 +112,7 @@ def install_system_deps():
         deps_to_install.append('curl')
     
     if deps_to_install:
-        console.print(f"需要安装: {', '.join(deps_to_install)}")
+        safe_print(f"需要安装: {', '.join(deps_to_install)}")
         
         # 更新包列表
         run_command("apt-get update")
@@ -73,38 +128,38 @@ def install_system_deps():
         # 清理
         run_command("rm -rf /var/lib/apt/lists/*")
         
-        console.print("✅ 系统依赖安装完成", style="green")
+        safe_print("✅ 系统依赖安装完成", style="green")
     else:
-        console.print("✅ 系统依赖已满足", style="green")
+        safe_print("✅ 系统依赖已满足", style="green")
 
 
 def setup_nokube_repo():
     """设置nokube代码仓库"""
-    console.print("📥 设置 nokube 代码仓库...", style="blue")
+    safe_print("📥 设置 nokube 代码仓库...", style="blue")
     
     nokube_dir = Path("/opt/nokube")
     repo_url = "https://github.com/AI-Infra-Team/nokube.git"
     
     if nokube_dir.exists():
-        console.print("🔄 更新现有仓库...")
+        safe_print("🔄 更新现有仓库...")
         try:
             # 检查网络连接和代理设置
-            console.print("🌐 检查网络连接...")
+            safe_print("🌐 检查网络连接...")
             proxy_vars = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]
             active_proxies = [f"{k}={os.environ[k]}" for k in proxy_vars if k in os.environ]
             if active_proxies:
-                console.print(f"🔗 使用代理: {', '.join(active_proxies)}")
+                safe_print(f"🔗 使用代理: {', '.join(active_proxies)}")
             else:
-                console.print("🔗 未设置代理")
+                safe_print("🔗 未设置代理")
             
             run_command("git pull", cwd=nokube_dir, check=False)
-            console.print("✅ 仓库更新完成", style="green")
+            safe_print("✅ 仓库更新完成", style="green")
         except Exception as e:
-            console.print(f"⚠️ 仓库更新失败，继续使用现有代码: {e}", style="yellow")
+            safe_print(f"⚠️ 仓库更新失败，继续使用现有代码: {e}", style="yellow")
     else:
-        console.print("📦 克隆新仓库...")
-        console.print("⚠️ 代码仓库应该在容器启动脚本中克隆", style="yellow")
-        console.print("如果看到此消息，说明启动脚本可能有问题", style="yellow")
+        safe_print("📦 克隆新仓库...")
+        safe_print("⚠️ 代码仓库应该在容器启动脚本中克隆", style="yellow")
+        safe_print("如果看到此消息，说明启动脚本可能有问题", style="yellow")
         # 这里不再尝试克隆，因为应该在启动脚本中完成
         if not nokube_dir.exists():
             raise RuntimeError("nokube代码目录不存在，请检查容器启动脚本")
@@ -112,7 +167,7 @@ def setup_nokube_repo():
 
 def install_python_deps():
     """安装Python依赖"""
-    console.print("🐍 安装 Python 依赖...", style="blue")
+    safe_print("🐍 安装 Python 依赖...", style="blue")
     
     nokube_dir = Path("/opt/nokube")
     if not nokube_dir.exists():
@@ -121,15 +176,15 @@ def install_python_deps():
     # 安装项目依赖
     try:
         run_command("pip install --no-cache-dir -e .", cwd=nokube_dir)
-        console.print("✅ Python 依赖安装完成", style="green")
+        safe_print("✅ Python 依赖安装完成", style="green")
     except Exception as e:
-        console.print(f"❌ Python 依赖安装失败: {e}", style="red")
+        safe_print(f"❌ Python 依赖安装失败: {e}", style="red")
         raise
 
 
 def setup_directories():
     """创建必要的目录"""
-    console.print("📁 创建必要目录...", style="blue")
+    safe_print("📁 创建必要目录...", style="blue")
     
     directories = [
         "/app/data",
@@ -140,15 +195,15 @@ def setup_directories():
     
     for directory in directories:
         Path(directory).mkdir(parents=True, exist_ok=True)
-        console.print(f"✅ 创建目录: {directory}")
+        safe_print(f"✅ 创建目录: {directory}")
 
 
 def setup_config_from_env():
     """从环境变量设置配置文件"""
-    console.print("⚙️ 配置环境变量处理...", style="blue")
+    safe_print("⚙️ 配置环境变量处理...", style="blue")
     
     config_path = os.environ.get('CONFIG_PATH', '/app/config/repos.yaml')
-    console.print(f"配置文件路径: {config_path}")
+    safe_print(f"配置文件路径: {config_path}")
     
     # 确保配置目录存在
     config_dir = Path(config_path).parent
@@ -156,7 +211,7 @@ def setup_config_from_env():
     
     # 如果配置文件不存在，尝试从环境变量创建
     if not Path(config_path).exists():
-        console.print("📝 配置文件不存在，尝试从环境变量创建...")
+        safe_print("📝 配置文件不存在，尝试从环境变量创建...")
         
         # 尝试从REPOS_YAML环境变量获取
         repos_yaml = os.environ.get('REPOS_YAML')
@@ -165,17 +220,17 @@ def setup_config_from_env():
             github_token = os.environ.get('GITHUB_TOKEN', '')
             if github_token and '${GITHUB_TOKEN}' in repos_yaml:
                 repos_yaml = repos_yaml.replace('${GITHUB_TOKEN}', github_token)
-                console.print("🔑 已替换GitHub token")
+                safe_print("🔑 已替换GitHub token")
             
             # 写入配置文件
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.write(repos_yaml)
-            console.print(f"✅ 已从环境变量创建配置文件: {config_path}", style="green")
+            safe_print(f"✅ 已从环境变量创建配置文件: {config_path}", style="green")
         else:
-            console.print("❌ 未找到 REPOS_YAML 环境变量", style="red")
+            safe_print("❌ 未找到 REPOS_YAML 环境变量", style="red")
             return False
     else:
-        console.print("✅ 配置文件已存在", style="green")
+        safe_print("✅ 配置文件已存在", style="green")
     
     # 显示配置文件内容预览（脱敏）
     try:
@@ -195,18 +250,26 @@ def setup_config_from_env():
         if len(content.split('\n')) > 20:
             preview += '\n...(更多内容已省略)'
         
-        console.print("\n📋 配置文件内容预览:")
-        console.print(Panel(preview, title="repos.yaml", border_style="cyan"))
+        safe_print("\n📋 配置文件内容预览:")
+        if console:
+            from rich.panel import Panel
+            console.print(Panel(preview, title="repos.yaml", border_style="cyan"))
+        else:
+            print("=" * 50)
+            print("repos.yaml 预览:")
+            print("=" * 50)
+            print(preview)
+            print("=" * 50)
         
     except Exception as e:
-        console.print(f"⚠️ 无法读取配置文件预览: {e}", style="yellow")
+        safe_print(f"⚠️ 无法读取配置文件预览: {e}", style="yellow")
     
     return True
 
 
 def check_health():
     """健康检查"""
-    console.print("🏥 执行健康检查...", style="blue")
+    safe_print("🏥 执行健康检查...", style="blue")
     
     checks = []
     
@@ -241,73 +304,111 @@ def check_health():
         checks.append(("数据目录", f"❌ {data_dir}"))
     
     # 显示检查结果
-    console.print("\n🔍 健康检查结果:")
+    safe_print("\n🔍 健康检查结果:")
     for check_name, status in checks:
-        console.print(f"  {check_name}: {status}")
+        safe_print(f"  {check_name}: {status}")
     
     # 检查是否有失败项
     failed_checks = [name for name, status in checks if "❌" in status]
     if failed_checks:
-        console.print(f"\n❌ 失败的检查项: {', '.join(failed_checks)}", style="red")
+        safe_print(f"\n❌ 失败的检查项: {', '.join(failed_checks)}", style="red")
         return False
     else:
-        console.print("\n✅ 所有检查通过", style="green")
+        safe_print("\n✅ 所有检查通过", style="green")
         return True
 
 
 def main():
     """主函数"""
-    console.print("🚀 Git Watcher 环境准备开始", style="bold blue")
+    print("🚀 Git Watcher 环境准备开始")
     
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
+        # 第一步：安装基础Python依赖（包括rich）
+        print("第1步：安装基础Python依赖...")
+        install_basic_python_deps()
+        
+        # 第二步：初始化rich console
+        print("第2步：初始化显示组件...")
+        if not init_rich_console():
+            print("❌ 无法初始化显示组件，继续使用基础显示")
+        
+        # 现在可以使用rich的功能了
+        safe_print("🚀 Git Watcher 环境准备开始", style="bold blue")
+        
+        # 使用进度条（如果rich可用）
+        if console:
+            from rich.progress import Progress, SpinnerColumn, TextColumn
             
-            # 系统依赖
-            task = progress.add_task("安装系统依赖...", total=None)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                
+                # 系统依赖
+                task = progress.add_task("安装系统依赖...", total=None)
+                install_system_deps()
+                progress.update(task, description="✅ 系统依赖")
+                
+                # 设置目录
+                task = progress.add_task("创建目录...", total=None)
+                setup_directories()
+                progress.update(task, description="✅ 目录创建")
+                
+                # 代码仓库
+                task = progress.add_task("设置代码仓库...", total=None)
+                setup_nokube_repo()
+                progress.update(task, description="✅ 代码仓库")
+                
+                # Python依赖
+                task = progress.add_task("安装Python依赖...", total=None)
+                install_python_deps()
+                progress.update(task, description="✅ Python依赖")
+                
+                # 配置文件
+                task = progress.add_task("配置环境...", total=None)
+                config_ok = setup_config_from_env()
+                if not config_ok:
+                    progress.update(task, description="❌ 配置失败")
+                    return 1
+                progress.update(task, description="✅ 环境配置")
+        else:
+            # 没有rich，使用简单模式
+            print("第3步：安装系统依赖...")
             install_system_deps()
-            progress.update(task, description="✅ 系统依赖")
             
-            # 设置目录
-            task = progress.add_task("创建目录...", total=None)
+            print("第4步：创建目录...")
             setup_directories()
-            progress.update(task, description="✅ 目录创建")
             
-            # 代码仓库
-            task = progress.add_task("设置代码仓库...", total=None)
+            print("第5步：设置代码仓库...")
             setup_nokube_repo()
-            progress.update(task, description="✅ 代码仓库")
             
-            # Python依赖
-            task = progress.add_task("安装Python依赖...", total=None)
+            print("第6步：安装Python依赖...")
             install_python_deps()
-            progress.update(task, description="✅ Python依赖")
             
-            # 配置文件
-            task = progress.add_task("配置环境...", total=None)
+            print("第7步：配置环境...")
             config_ok = setup_config_from_env()
             if not config_ok:
-                progress.update(task, description="❌ 配置失败")
+                print("❌ 配置失败")
                 return 1
-            progress.update(task, description="✅ 环境配置")
         
         # 健康检查
         if not check_health():
             return 1
         
-        console.print("\n🎉 环境准备完成，可以启动监控器了！", style="bold green")
+        safe_print("\n🎉 环境准备完成，可以启动监控器了！", style="bold green")
         return 0
         
     except KeyboardInterrupt:
-        console.print("\n🛑 用户中断", style="yellow")
+        safe_print("\n🛑 用户中断", style="yellow")
         return 1
     except Exception as e:
-        console.print(f"\n❌ 环境准备失败: {e}", style="red")
+        safe_print(f"\n❌ 环境准备失败: {e}", style="red")
         import traceback
-        console.print(traceback.format_exc(), style="dim red")
+        if console:
+            console.print(traceback.format_exc(), style="dim red")
+        else:
+            print(traceback.format_exc())
         return 1
 
 
